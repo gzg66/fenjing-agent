@@ -1,0 +1,1192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>分镜AI导演</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+/* ── CSS 变量 ── */
+:root {
+  --primary: #6366f1;
+  --primary-dark: #4f46e5;
+  --primary-light: #a5b4fc;
+  --bg: #f0f2f5;
+  --surface: #ffffff;
+  --text: #1e293b;
+  --text-secondary: #64748b;
+  --border: #e2e8f0;
+  --user-bg: linear-gradient(135deg, #6366f1, #8b5cf6);
+  --agent-bg: #ffffff;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.06);
+  --shadow-md: 0 4px 12px rgba(0,0,0,.08);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,.12);
+  --radius: 16px;
+  --radius-sm: 10px;
+  /* ── 步骤卡片色板 ── */
+  --think-bg: #fefce8;
+  --think-border: #fde047;
+  --think-text: #854d0e;
+  --tool-bg: #eff6ff;
+  --tool-border: #93c5fd;
+  --tool-text: #1e40af;
+  --result-bg: #f0fdf4;
+  --result-border: #86efac;
+  --result-text: #166534;
+  --error-bg: #fef2f2;
+  --error-border: #fca5a5;
+  --error-text: #991b1b;
+}
+/* ── 基础重置 ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+}
+/* ── 全局布局 ── */
+.app {
+  display: flex; flex-direction: column;
+  height: 100vh; max-width: 900px;
+  margin: 0 auto;
+  background: var(--bg);
+}
+
+/* ── 顶栏 ── */
+.header {
+  background: linear-gradient(135deg, #4f46e5, #7c3aed, #a855f7);
+  color: white;
+  padding: 16px 24px;
+  display: flex; align-items: center; gap: 12px;
+  box-shadow: var(--shadow-md);
+  flex-shrink: 0;
+  z-index: 10;
+}
+.header-icon { font-size: 28px; }
+.header-info h1 { font-size: 18px; font-weight: 600; letter-spacing: .5px; }
+.header-info p { font-size: 12px; opacity: .85; margin-top: 2px; }
+.header-actions { margin-left: auto; display: flex; gap: 8px; }
+.btn-header {
+  background: rgba(255,255,255,.18); border: none; color: white;
+  padding: 6px 14px; border-radius: 20px; font-size: 13px;
+  cursor: pointer; transition: background .2s;
+}
+.btn-header:hover { background: rgba(255,255,255,.3); }
+
+/* ── 聊天区域 ── */
+.chat-area {
+  flex: 1; overflow-y: auto;
+  padding: 20px 16px;
+  scroll-behavior: smooth;
+}
+.chat-area::-webkit-scrollbar { width: 6px; }
+.chat-area::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+/* ── 欢迎信息 ── */
+.welcome {
+  text-align: center; padding: 48px 20px;
+  animation: fadeIn .5s ease;
+}
+.welcome-icon { font-size: 56px; margin-bottom: 16px; }
+.welcome h2 { font-size: 22px; color: var(--text); margin-bottom: 8px; }
+.welcome p { color: var(--text-secondary); font-size: 14px; line-height: 1.6; max-width: 400px; margin: 0 auto; }
+.tips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 20px; }
+.tip {
+  background: var(--surface); border: 1px solid var(--border);
+  padding: 8px 16px; border-radius: 20px;
+  font-size: 13px; color: var(--text-secondary);
+  cursor: pointer; transition: all .2s;
+}
+.tip:hover { border-color: var(--primary); color: var(--primary); transform: translateY(-1px); }
+
+/* ── 消息气泡 ── */
+.message {
+  display: flex; gap: 10px;
+  margin-bottom: 16px;
+  animation: slideUp .3s ease;
+}
+.message.user { flex-direction: row-reverse; }
+.avatar {
+  width: 36px; height: 36px;
+  border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px;
+}
+.message.user .avatar { background: var(--user-bg); }
+.message.agent .avatar { background: linear-gradient(135deg, #f1f5f9, #e2e8f0); }
+.bubble {
+  max-width: 75%; padding: 12px 16px;
+  border-radius: var(--radius);
+  line-height: 1.65; font-size: 14.5px;
+  box-shadow: var(--shadow-sm);
+  word-break: break-word;
+}
+.message.user .bubble {
+  background: var(--user-bg); color: white;
+  border-bottom-right-radius: 4px;
+}
+.message.agent .bubble {
+  background: var(--agent-bg); color: var(--text);
+  border-bottom-left-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+/* ── 气泡内 Markdown 样式 ── */
+.bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 6px; }
+.bubble h1 { font-size: 17px; }
+.bubble h2 { font-size: 15.5px; }
+.bubble h3 { font-size: 14.5px; }
+.bubble p { margin: 4px 0; }
+.bubble ul, .bubble ol { padding-left: 20px; margin: 4px 0; }
+.bubble li { margin: 2px 0; }
+.bubble strong { font-weight: 600; }
+.bubble code {
+  background: rgba(0,0,0,.06); padding: 1px 5px;
+  border-radius: 4px; font-size: 13px;
+}
+.message.user .bubble code { background: rgba(255,255,255,.2); }
+.bubble pre {
+  background: #1e293b; color: #e2e8f0;
+  padding: 12px; border-radius: 8px;
+  overflow-x: auto; margin: 8px 0; font-size: 13px;
+}
+.bubble pre code { background: none; padding: 0; color: inherit; }
+.bubble blockquote {
+  border-left: 3px solid var(--primary-light); padding-left: 12px;
+  margin: 8px 0; color: var(--text-secondary);
+}
+.bubble table { border-collapse: collapse; margin: 8px 0; width: 100%; font-size: 13px; }
+.bubble th, .bubble td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.bubble th { background: #f8fafc; font-weight: 600; }
+
+/* ── 消息中的图片 ── */
+.msg-images {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 8px;
+}
+.msg-images img {
+  width: 80px; height: 80px;
+  object-fit: cover; border-radius: 8px;
+  cursor: pointer; transition: transform .2s;
+  border: 2px solid rgba(255,255,255,.3);
+}
+.msg-images img:hover { transform: scale(1.05); }
+
+/* ================================================
+   ██ 步骤卡片 (思考 / 工具调用 / 工具结果)
+   ================================================ */
+.step-container {
+  margin-bottom: 16px;
+  margin-left: 46px; /* 与 agent 气泡左侧对齐 (avatar 36 + gap 10) */
+  animation: slideUp .3s ease;
+}
+
+/* ── 折叠开关 ── */
+.step-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text-secondary);
+  cursor: pointer; user-select: none;
+  padding: 4px 12px;
+  border-radius: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  transition: all .2s;
+  margin-bottom: 6px;
+}
+.step-toggle:hover { background: #f8fafc; border-color: var(--primary-light); }
+.step-toggle .arrow {
+  display: inline-block; transition: transform .2s;
+  font-size: 10px;
+}
+.step-toggle.collapsed .arrow { transform: rotate(-90deg); }
+.step-toggle .step-count {
+  background: var(--primary);
+  color: white;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+
+/* ── 步骤列表 ── */
+.step-list {
+  display: flex; flex-direction: column; gap: 6px;
+  overflow: hidden;
+  transition: max-height .3s ease, opacity .3s ease;
+}
+.step-list.collapsed {
+  max-height: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ── 单个步骤卡片 ── */
+.step-card {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid;
+  font-size: 13px;
+  line-height: 1.55;
+  font-family: "SF Mono", "Consolas", "Menlo", monospace;
+  animation: stepSlideIn .25s ease;
+  word-break: break-word;
+}
+.step-card .step-icon {
+  flex-shrink: 0; font-size: 14px;
+  width: 20px; text-align: center;
+  line-height: 1.55;
+}
+.step-card .step-body {
+  flex: 1; min-width: 0;
+}
+.step-card .step-label {
+  font-weight: 600; font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  margin-bottom: 2px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+.step-card .step-text {
+  white-space: pre-wrap;
+  max-height: 150px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.step-card .step-text::-webkit-scrollbar { width: 4px; }
+.step-card .step-text::-webkit-scrollbar-thumb { background: rgba(0,0,0,.15); border-radius: 2px; }
+
+/* 思考卡片 */
+.step-card.thinking {
+  background: var(--think-bg);
+  border-left-color: var(--think-border);
+  color: var(--think-text);
+}
+.step-card.thinking .step-label { color: #a16207; }
+
+/* 工具调用卡片 */
+.step-card.tool-call {
+  background: var(--tool-bg);
+  border-left-color: var(--tool-border);
+  color: var(--tool-text);
+}
+.step-card.tool-call .step-label { color: #1d4ed8; }
+.step-card.tool-call .tool-name {
+  display: inline-block;
+  background: #dbeafe;
+  padding: 1px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 12px;
+}
+.step-card.tool-call .tool-args {
+  margin-top: 4px;
+  background: rgba(0,0,0,.04);
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  max-height: 100px;
+  overflow-y: auto;
+}
+
+/* 工具结果卡片 */
+.step-card.tool-result {
+  background: var(--result-bg);
+  border-left-color: var(--result-border);
+  color: var(--result-text);
+}
+.step-card.tool-result .step-label { color: #15803d; }
+
+/* 错误卡片 */
+.step-card.step-error {
+  background: var(--error-bg);
+  border-left-color: var(--error-border);
+  color: var(--error-text);
+}
+
+/* ── 进度指示器 (放在 step-container 底部) ── */
+.step-progress {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px; color: var(--text-secondary);
+  animation: fadeIn .3s ease;
+}
+.step-progress .spinner {
+  width: 14px; height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── 加载动画 (旧版，保留给初始 typing) ── */
+.typing { display: flex; gap: 10px; margin-bottom: 16px; }
+.typing .avatar { background: linear-gradient(135deg, #f1f5f9, #e2e8f0); }
+.typing-dots {
+  background: var(--agent-bg); border: 1px solid var(--border);
+  padding: 14px 20px; border-radius: var(--radius);
+  border-bottom-left-radius: 4px;
+  display: flex; gap: 5px; align-items: center;
+  box-shadow: var(--shadow-sm);
+}
+.typing-dots span {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-secondary);
+  animation: bounce .6s infinite alternate;
+}
+.typing-dots span:nth-child(2) { animation-delay: .2s; }
+.typing-dots span:nth-child(3) { animation-delay: .4s; }
+
+/* ── 上传预览栏 ── */
+.upload-bar {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: none;
+}
+.upload-bar.show { display: block; }
+.upload-bar-inner {
+  display: flex; gap: 8px; overflow-x: auto;
+  padding: 4px 0;
+}
+.upload-item {
+  position: relative; flex-shrink: 0;
+}
+.upload-item img {
+  width: 64px; height: 64px;
+  object-fit: cover; border-radius: 8px;
+  border: 2px solid var(--border);
+}
+.upload-item .remove {
+  position: absolute; top: -6px; right: -6px;
+  width: 20px; height: 20px;
+  background: #ef4444; color: white;
+  border: 2px solid white; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; cursor: pointer;
+  line-height: 1; font-weight: bold;
+}
+.upload-item .remove:hover { background: #dc2626; }
+.upload-item .file-name {
+  font-size: 10px; color: var(--text-secondary);
+  text-align: center; max-width: 64px;
+  overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; margin-top: 2px;
+}
+
+/* ── 输入区域 ── */
+.input-area {
+  flex-shrink: 0;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  padding: 12px 16px;
+  box-shadow: 0 -2px 8px rgba(0,0,0,.04);
+}
+.input-row {
+  display: flex; align-items: flex-end; gap: 8px;
+}
+.btn-icon {
+  width: 40px; height: 40px;
+  border: none; border-radius: 50%;
+  background: transparent; color: var(--text-secondary);
+  font-size: 20px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all .2s; flex-shrink: 0;
+}
+.btn-icon:hover { background: var(--bg); color: var(--primary); }
+#messageInput {
+  flex: 1; border: 1.5px solid var(--border);
+  border-radius: 22px; padding: 10px 18px;
+  font-size: 14.5px; font-family: inherit;
+  resize: none; outline: none;
+  min-height: 42px; max-height: 120px;
+  line-height: 1.5;
+  transition: border-color .2s;
+}
+#messageInput:focus { border-color: var(--primary); }
+#messageInput::placeholder { color: #94a3b8; }
+.btn-send {
+  width: 42px; height: 42px;
+  border: none; border-radius: 50%;
+  background: var(--user-bg); color: white;
+  font-size: 18px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform .15s, opacity .2s;
+  flex-shrink: 0;
+}
+.btn-send:hover { transform: scale(1.06); }
+.btn-send:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+.input-hint {
+  font-size: 11px; color: #94a3b8;
+  text-align: center; margin-top: 6px;
+}
+
+/* ── 拖拽覆盖层 ── */
+.drag-overlay {
+  position: fixed; inset: 0;
+  background: rgba(99,102,241,.12);
+  backdrop-filter: blur(4px);
+  display: none; align-items: center; justify-content: center;
+  z-index: 100;
+  border: 3px dashed var(--primary);
+}
+.drag-overlay.show { display: flex; }
+.drag-overlay-text {
+  background: var(--surface); padding: 24px 40px;
+  border-radius: 16px; box-shadow: var(--shadow-lg);
+  font-size: 18px; color: var(--primary);
+  font-weight: 600;
+}
+
+/* ── 状态面板 ── */
+.state-panel {
+  position: fixed; top: 70px; right: 16px;
+  width: 280px; background: var(--surface);
+  border-radius: 12px; box-shadow: var(--shadow-lg);
+  border: 1px solid var(--border);
+  padding: 16px; z-index: 50;
+  display: none; animation: fadeIn .2s ease;
+}
+.state-panel.show { display: block; }
+.state-panel h3 { font-size: 15px; margin-bottom: 12px; color: var(--text); }
+.state-item {
+  display: flex; gap: 8px; align-items: center;
+  padding: 6px 0; font-size: 13px;
+  border-bottom: 1px solid #f1f5f9;
+}
+.state-item:last-child { border-bottom: none; }
+.state-item .label { color: var(--text-secondary); min-width: 70px; }
+.state-item .value { color: var(--text); font-weight: 500; }
+.state-item .value.empty { color: #94a3b8; font-weight: 400; }
+
+/* ── 图片预览弹窗 ── */
+.lightbox {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.85);
+  display: none; align-items: center; justify-content: center;
+  z-index: 200; cursor: zoom-out;
+}
+.lightbox.show { display: flex; }
+.lightbox img {
+  max-width: 90vw; max-height: 90vh;
+  border-radius: 8px; box-shadow: 0 0 40px rgba(0,0,0,.5);
+}
+
+/* ── 动画 ── */
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes stepSlideIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes bounce {
+  from { transform: translateY(0); opacity: .4; }
+  to   { transform: translateY(-6px); opacity: 1; }
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- 顶栏 -->
+  <header class="header">
+    <div class="header-icon">🎬</div>
+    <div class="header-info">
+      <h1>分镜AI导演</h1>
+      <p>智能视频分镜脚本生成</p>
+    </div>
+    <div class="header-actions">
+      <button class="btn-header" onclick="toggleState()">📊 状态</button>
+      <button class="btn-header" onclick="resetSession()">🔄 新会话</button>
+    </div>
+  </header>
+
+  <!-- 聊天区域 -->
+  <div class="chat-area" id="chatArea">
+    <div class="welcome" id="welcome">
+      <div class="welcome-icon">🎬</div>
+      <h2>欢迎使用分镜AI导演</h2>
+      <p>告诉我你想要什么样的视频，我来帮你生成专业的分镜脚本！<br>你可以上传角色参考图来辅助创作。</p>
+      <div class="tips">
+        <div class="tip" onclick="useTip(this)">🏮 元宵节灯会创意视频</div>
+        <div class="tip" onclick="useTip(this)">⚔️ 武侠角色动作展示</div>
+        <div class="tip" onclick="useTip(this)">🏔️ 山水风景旅拍短片</div>
+        <div class="tip" onclick="useTip(this)">🎮 游戏角色宣传 CG</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 上传预览栏 -->
+  <div class="upload-bar" id="uploadBar">
+    <div class="upload-bar-inner" id="uploadPreview"></div>
+  </div>
+
+  <!-- 输入区域 -->
+  <div class="input-area">
+    <div class="input-row">
+      <input type="file" id="fileInput" multiple accept="image/*" hidden>
+      <button class="btn-icon" onclick="document.getElementById('fileInput').click()" title="上传参考图片">📎</button>
+      <textarea id="messageInput" placeholder="描述你的视频创意，或回答AI导演的问题..." rows="1"></textarea>
+      <button class="btn-send" id="sendBtn" onclick="sendMessage()" title="发送">➤</button>
+    </div>
+    <div class="input-hint">Enter 发送 · Shift + Enter 换行 · 支持拖拽上传图片</div>
+  </div>
+</div>
+
+<!-- 状态面板 -->
+<div class="state-panel" id="statePanel">
+  <h3>📊 工作流状态</h3>
+  <div class="state-item"><span class="label">📖 故事概念</span><span class="value empty" id="sConcept">未设定</span></div>
+  <div class="state-item"><span class="label">⏱️ 时长</span><span class="value empty" id="sDuration">未设定</span></div>
+  <div class="state-item"><span class="label">📐 画幅比例</span><span class="value empty" id="sRatio">未设定</span></div>
+  <div class="state-item"><span class="label">🎨 视觉风格</span><span class="value empty" id="sStyle">未设定</span></div>
+  <div class="state-item"><span class="label">🖼️ 参考图</span><span class="value empty" id="sImages">0 张</span></div>
+  <div class="state-item"><span class="label">📋 分镜脚本</span><span class="value empty" id="sStoryboard">未生成</span></div>
+  <div class="state-item"><span class="label">🎬 任务ID</span><span class="value empty" id="sTaskId">未提交</span></div>
+</div>
+
+<!-- 拖拽覆盖层 -->
+<div class="drag-overlay" id="dragOverlay">
+  <div class="drag-overlay-text">📎 松开鼠标上传参考图片</div>
+</div>
+
+<!-- 图片预览弹窗 -->
+<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+  <img id="lightboxImg" src="" alt="预览">
+</div>
+
+<script>
+// ============================================================
+// 状态与 DOM 引用
+// ============================================================
+let sessionId = crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2);
+let pendingFiles = [];   // { file, dataUrl, name }
+let isSending = false;
+let isWaitingForAnswer = false;  // 当 Agent ask_user 时为 true
+
+const chatArea    = document.getElementById('chatArea');
+const welcome     = document.getElementById('welcome');
+const uploadBar   = document.getElementById('uploadBar');
+const uploadPrev  = document.getElementById('uploadPreview');
+const msgInput    = document.getElementById('messageInput');
+const sendBtn     = document.getElementById('sendBtn');
+const fileInput   = document.getElementById('fileInput');
+const statePanel  = document.getElementById('statePanel');
+const dragOverlay = document.getElementById('dragOverlay');
+const lightbox    = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightboxImg');
+
+// ============================================================
+// 核心发送逻辑 (SSE 流式)
+// ============================================================
+async function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text && pendingFiles.length === 0) return;
+
+  // 如果 Agent 正在等待回答，走 answer 接口
+  if (isWaitingForAnswer) {
+    await answerAgent(text);
+    return;
+  }
+
+  if (isSending) return;
+  isSending = true;
+  sendBtn.disabled = true;
+
+  // 隐藏欢迎信息
+  if (welcome) welcome.style.display = 'none';
+
+  // 上传文件（如有）
+  let fileUrls = [];
+  let imageDataUrls = [];
+  if (pendingFiles.length > 0) {
+    imageDataUrls = pendingFiles.map(f => f.dataUrl);
+    try {
+      fileUrls = await uploadFiles(pendingFiles);
+    } catch (e) {
+      // 上传失败不阻塞文字发送，仅提示
+      console.warn('Upload failed:', e);
+      addMessage('agent', '⚠️ 图片上传失败（仅发送文字）：' + e.message);
+    }
+    clearPendingFiles();
+  }
+
+  // 显示用户消息
+  addMessage('user', text, imageDataUrls);
+  msgInput.value = '';
+  autoResize();
+
+  // 开始 SSE 流式接收
+  await startSSEStream(text, fileUrls);
+
+  isSending = false;
+  sendBtn.disabled = false;
+  msgInput.focus();
+}
+
+// ── 回答 Agent 追问（支持附带图片） ──
+async function answerAgent(text) {
+  isWaitingForAnswer = false;
+
+  // 上传附带的图片（如有）
+  let fileUrls = [];
+  let imageDataUrls = [];
+  if (pendingFiles.length > 0) {
+    imageDataUrls = pendingFiles.map(f => f.dataUrl);
+    try {
+      fileUrls = await uploadFiles(pendingFiles);
+    } catch (e) {
+      console.warn('Upload failed during answer:', e);
+      addMessage('agent', '⚠️ 图片上传失败（仅发送文字）：' + e.message);
+    }
+    clearPendingFiles();
+  }
+
+  addMessage('user', text, imageDataUrls);
+  msgInput.value = '';
+  autoResize();
+
+  try {
+    await fetch('/api/chat/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, answer: text, file_urls: fileUrls }),
+    });
+  } catch (e) {
+    addMessage('agent', '⚠️ 发送回答失败：' + e.message);
+  }
+  // 注意：answer 后 Agent 线程继续运行，SSE 流还在活着，后续事件会继续推送
+}
+
+// ============================================================
+// SSE 流式接收
+// ============================================================
+async function startSSEStream(text, fileUrls) {
+  // ── 动态管理步骤容器：每组处理步骤对应其后续的回复消息 ──
+  let curContainer = null;   // 当前活跃的步骤容器
+  let curStepCount = 0;      // 当前容器内的步骤计数
+  let curProgress  = null;   // 当前容器的进度指示器
+
+  /** 确保有一个活跃的步骤容器（懒创建） */
+  function ensureContainer() {
+    if (!curContainer) {
+      curContainer = createStepContainer();
+      curStepCount = 0;
+      curProgress = createProgressIndicator('正在思考...');
+      curContainer._stepList.appendChild(curProgress);
+    }
+    return curContainer;
+  }
+
+  /** 结束当前步骤容器：有内容则折叠，无内容则移除 */
+  function finalizeContainer() {
+    if (!curContainer) return;
+    if (curProgress) { curProgress.remove(); curProgress = null; }
+    if (curStepCount === 0) {
+      curContainer.remove();
+    } else {
+      collapseSteps(curContainer);
+    }
+    curContainer = null;
+    curStepCount = 0;
+  }
+
+  try {
+    const response = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, message: text, file_urls: fileUrls }),
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // 按 \n\n 分割 SSE 事件
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop(); // 最后一段可能不完整
+
+      for (const part of parts) {
+        if (!part.trim() || part.trim().startsWith(':')) continue;
+
+        let eventType = 'message';
+        let eventData = '';
+
+        for (const line of part.split('\n')) {
+          if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+          else if (line.startsWith('data: ')) eventData = line.slice(6);
+        }
+
+        if (!eventData) continue;
+
+        let data;
+        try { data = JSON.parse(eventData); } catch { continue; }
+
+        switch (eventType) {
+          case 'thinking': {
+            const sc = ensureContainer();
+            if (curProgress) curProgress.remove();
+            curStepCount++;
+            addThinkingCard(sc._stepList, data.content);
+            updateStepToggle(sc._toggle, curStepCount);
+            curProgress.querySelector('.progress-text').textContent = '正在思考...';
+            sc._stepList.appendChild(curProgress);
+            break;
+          }
+
+          case 'tool_call': {
+            const sc = ensureContainer();
+            if (curProgress) curProgress.remove();
+            curStepCount++;
+            addToolCallCard(sc._stepList, data.name, data.args);
+            updateStepToggle(sc._toggle, curStepCount);
+            curProgress.querySelector('.progress-text').textContent = `调用 ${data.name}...`;
+            sc._stepList.appendChild(curProgress);
+            break;
+          }
+
+          case 'tool_result': {
+            const sc = ensureContainer();
+            if (curProgress) curProgress.remove();
+            curStepCount++;
+            addToolResultCard(sc._stepList, data.name, data.content);
+            updateStepToggle(sc._toggle, curStepCount);
+            curProgress.querySelector('.progress-text').textContent = '处理中...';
+            sc._stepList.appendChild(curProgress);
+            break;
+          }
+
+          case 'response':
+            // 先结束步骤容器，再显示回复 → 步骤紧贴在对应回复上方
+            finalizeContainer();
+            addMessage('agent', data.content);
+            break;
+
+          case 'question':
+            // 同理：步骤容器在追问消息上方
+            finalizeContainer();
+            addMessage('agent', data.content);
+            isWaitingForAnswer = true;
+            sendBtn.disabled = false;
+            msgInput.focus();
+            msgInput.placeholder = '请回答上面的问题...';
+            break;
+
+          case 'done':
+            finalizeContainer();
+            break;
+
+          case 'error': {
+            const sc = ensureContainer();
+            addErrorCard(sc._stepList, data.content);
+            break;
+          }
+        }
+
+        scrollToBottom();
+      }
+    }
+  } catch (e) {
+    addMessage('agent', '⚠️ 连接中断：' + e.message);
+  }
+
+  // 最终清理残留的步骤容器
+  finalizeContainer();
+
+  // 恢复输入框状态
+  msgInput.placeholder = '描述你的视频创意，或回答AI导演的问题...';
+  scrollToBottom();
+}
+
+// ============================================================
+// 步骤容器创建
+// ============================================================
+function createStepContainer() {
+  const container = document.createElement('div');
+  container.className = 'step-container';
+
+  // 折叠开关
+  const toggle = document.createElement('div');
+  toggle.className = 'step-toggle';
+  toggle.innerHTML = `<span class="arrow">▼</span> <span>处理步骤</span> <span class="step-count">0</span>`;
+  toggle.onclick = () => toggleStepCollapse(container);
+  container.appendChild(toggle);
+
+  // 步骤列表
+  const stepList = document.createElement('div');
+  stepList.className = 'step-list';
+  container.appendChild(stepList);
+
+  // 缓存引用
+  container._toggle = toggle;
+  container._stepList = stepList;
+
+  chatArea.appendChild(container);
+  scrollToBottom();
+  return container;
+}
+
+function updateStepToggle(toggle, count) {
+  toggle.querySelector('.step-count').textContent = count;
+}
+
+function toggleStepCollapse(container) {
+  const toggle = container._toggle;
+  const stepList = container._stepList;
+  const isCollapsed = stepList.classList.contains('collapsed');
+  if (isCollapsed) {
+    stepList.classList.remove('collapsed');
+    stepList.style.maxHeight = stepList.scrollHeight + 'px';
+    toggle.classList.remove('collapsed');
+  } else {
+    collapseSteps(container);
+  }
+}
+
+function collapseSteps(container) {
+  const stepList = container._stepList;
+  const toggle = container._toggle;
+  stepList.style.maxHeight = stepList.scrollHeight + 'px';
+  // 触发 reflow
+  stepList.offsetHeight;
+  stepList.classList.add('collapsed');
+  toggle.classList.add('collapsed');
+}
+
+// ============================================================
+// 步骤卡片创建函数
+// ============================================================
+function addThinkingCard(parent, content) {
+  const card = document.createElement('div');
+  card.className = 'step-card thinking';
+
+  // 截断超长的思考内容
+  let displayContent = content;
+  if (content.length > 500) {
+    displayContent = content.slice(0, 500) + '...';
+  }
+
+  card.innerHTML = `
+    <span class="step-icon">💭</span>
+    <div class="step-body">
+      <div class="step-label">思考</div>
+      <div class="step-text">${escapeHtml(displayContent)}</div>
+    </div>
+  `;
+  parent.appendChild(card);
+  scrollToBottom();
+}
+
+function addToolCallCard(parent, name, args) {
+  const card = document.createElement('div');
+  card.className = 'step-card tool-call';
+
+  let argsDisplay = '';
+  if (args && Object.keys(args).length > 0) {
+    argsDisplay = `<div class="tool-args">${escapeHtml(JSON.stringify(args, null, 2))}</div>`;
+  }
+
+  card.innerHTML = `
+    <span class="step-icon">🔧</span>
+    <div class="step-body">
+      <div class="step-label">调用工具</div>
+      <span class="tool-name">${escapeHtml(name)}</span>
+      ${argsDisplay}
+    </div>
+  `;
+  parent.appendChild(card);
+  scrollToBottom();
+}
+
+function addToolResultCard(parent, name, content) {
+  const card = document.createElement('div');
+  card.className = 'step-card tool-result';
+
+  let displayContent = content;
+  if (content.length > 300) {
+    displayContent = content.slice(0, 300) + '...';
+  }
+
+  card.innerHTML = `
+    <span class="step-icon">📋</span>
+    <div class="step-body">
+      <div class="step-label">结果 · ${escapeHtml(name)}</div>
+      <div class="step-text">${escapeHtml(displayContent)}</div>
+    </div>
+  `;
+  parent.appendChild(card);
+  scrollToBottom();
+}
+
+function addErrorCard(parent, content) {
+  const card = document.createElement('div');
+  card.className = 'step-card step-error';
+  card.innerHTML = `
+    <span class="step-icon">❌</span>
+    <div class="step-body">
+      <div class="step-label">错误</div>
+      <div class="step-text">${escapeHtml(content)}</div>
+    </div>
+  `;
+  parent.appendChild(card);
+  scrollToBottom();
+}
+
+// ============================================================
+// 进度指示器
+// ============================================================
+function createProgressIndicator(text) {
+  const div = document.createElement('div');
+  div.className = 'step-progress';
+  div.innerHTML = `<div class="spinner"></div><span class="progress-text">${escapeHtml(text)}</span>`;
+  return div;
+}
+
+// ============================================================
+// 消息气泡
+// ============================================================
+function addMessage(role, text, images) {
+  const div = document.createElement('div');
+  div.className = 'message ' + role;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = role === 'user' ? '👤' : '🤖';
+
+  const contentWrap = document.createElement('div');
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+
+  if (role === 'agent' && typeof marked !== 'undefined') {
+    bubble.innerHTML = marked.parse(text || '');
+  } else {
+    bubble.textContent = text || '';
+  }
+
+  contentWrap.appendChild(bubble);
+
+  // 图片
+  if (images && images.length > 0) {
+    const imgWrap = document.createElement('div');
+    imgWrap.className = 'msg-images';
+    for (const src of images) {
+      const img = document.createElement('img');
+      img.src = src;
+      img.alt = '参考图';
+      img.onclick = () => openLightbox(src);
+      imgWrap.appendChild(img);
+    }
+    contentWrap.appendChild(imgWrap);
+  }
+
+  div.appendChild(avatar);
+  div.appendChild(contentWrap);
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
+// ============================================================
+// 工具函数
+// ============================================================
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function scrollToBottom() {
+  requestAnimationFrame(() => {
+    chatArea.scrollTop = chatArea.scrollHeight;
+  });
+}
+
+// ── 上传文件到服务器 ──
+async function uploadFiles(files) {
+  const formData = new FormData();
+  formData.append('session_id', sessionId);
+  for (const f of files) {
+    formData.append('files', f.file);
+  }
+  let res;
+  try {
+    res = await fetch('/api/upload', { method: 'POST', body: formData });
+  } catch (netErr) {
+    throw new Error('网络错误，请检查服务器是否可达: ' + netErr.message);
+  }
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try { detail = JSON.stringify(await res.json()); } catch {}
+    throw new Error('上传失败 ' + detail);
+  }
+  const data = await res.json();
+  if (!data.files || data.files.length === 0) {
+    throw new Error('服务器未返回文件信息');
+  }
+  return data.files.map(f => f.url);
+}
+
+// ── 文件处理 ──
+fileInput.addEventListener('change', (e) => {
+  addFiles(e.target.files);
+  fileInput.value = '';
+});
+
+function addFiles(fileList) {
+  for (const file of fileList) {
+    if (!file.type.startsWith('image/')) continue;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      pendingFiles.push({ file, dataUrl: e.target.result, name: file.name });
+      renderUploadPreview();
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
+function renderUploadPreview() {
+  uploadPrev.innerHTML = '';
+  if (pendingFiles.length === 0) {
+    uploadBar.classList.remove('show');
+    return;
+  }
+  uploadBar.classList.add('show');
+  pendingFiles.forEach((f, idx) => {
+    const item = document.createElement('div');
+    item.className = 'upload-item';
+    item.innerHTML = `
+      <img src="${f.dataUrl}" alt="${f.name}">
+      <div class="remove" onclick="removePendingFile(${idx})">✕</div>
+      <div class="file-name">${f.name}</div>
+    `;
+    uploadPrev.appendChild(item);
+  });
+}
+
+function removePendingFile(idx) {
+  pendingFiles.splice(idx, 1);
+  renderUploadPreview();
+}
+
+function clearPendingFiles() {
+  pendingFiles = [];
+  renderUploadPreview();
+}
+
+// ── 拖拽上传 ──
+let dragCounter = 0;
+document.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragCounter++;
+  dragOverlay.classList.add('show');
+});
+document.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter <= 0) { dragCounter = 0; dragOverlay.classList.remove('show'); }
+});
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  dragOverlay.classList.remove('show');
+  if (e.dataTransfer.files.length > 0) addFiles(e.dataTransfer.files);
+});
+
+// ── 输入框自适应 ──
+msgInput.addEventListener('input', autoResize);
+function autoResize() {
+  msgInput.style.height = 'auto';
+  msgInput.style.height = Math.min(msgInput.scrollHeight, 120) + 'px';
+}
+
+// ── 键盘事件 ──
+msgInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// ── 快捷提示 ──
+function useTip(el) {
+  msgInput.value = el.textContent.replace(/^[^\s]+\s*/, '');
+  msgInput.focus();
+  autoResize();
+}
+
+// ── 状态面板 ──
+function toggleState() {
+  const show = !statePanel.classList.contains('show');
+  statePanel.classList.toggle('show');
+  if (show) refreshState();
+}
+
+async function refreshState() {
+  try {
+    const res = await fetch(`/api/state/${sessionId}`);
+    const s = await res.json();
+    setStateField('sConcept', s.story_concept);
+    setStateField('sDuration', s.duration ? s.duration + '秒' : null);
+    setStateField('sRatio', s.ratio);
+    setStateField('sStyle', s.style);
+    setStateField('sImages', (s.reference_images || []).length + ' 张');
+    setStateField('sStoryboard', s.storyboard_content ? '✅ 已生成' : null);
+    setStateField('sTaskId', s.video_task_id);
+  } catch (e) { /* ignore */ }
+}
+
+function setStateField(id, value) {
+  const el = document.getElementById(id);
+  if (value) {
+    el.textContent = value;
+    el.classList.remove('empty');
+  } else {
+    el.textContent = id === 'sImages' ? '0 张' : '未设定';
+    el.classList.add('empty');
+  }
+}
+
+// ── 新会话 ──
+function resetSession() {
+  sessionId = crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2);
+  chatArea.innerHTML = '';
+  if (welcome) { welcome.style.display = ''; chatArea.appendChild(welcome); }
+  clearPendingFiles();
+  isWaitingForAnswer = false;
+  isSending = false;
+  sendBtn.disabled = false;
+  msgInput.placeholder = '描述你的视频创意，或回答AI导演的问题...';
+}
+
+// ── 图片预览 ──
+function openLightbox(src) {
+  lightboxImg.src = src;
+  lightbox.classList.add('show');
+}
+function closeLightbox() {
+  lightbox.classList.remove('show');
+}
+
+// ── 粘贴图片 ──
+msgInput.addEventListener('paste', (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (file) addFiles([file]);
+    }
+  }
+});
+</script>
+</body>
+</html>
