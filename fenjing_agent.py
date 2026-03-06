@@ -107,13 +107,19 @@ def ask_user(question: str) -> str:
 
 
 @tool
-def generate_reference_images(prompt: str, image_size: str, num_images: int = 2) -> str:
+def generate_reference_images(
+    prompt: str,
+    image_size: str,
+    num_images: int = 2,
+    reference_image_urls: list[str] | None = None,
+) -> str:
     """调用 Gemini 图片生成模型生成参考图片。
 
     Args:
         prompt: 英文图片描述，应包含角色外貌、服装、姿势、表情、环境等细节。
         image_size: 图片尺寸。可选值：landscape_16_9 / portrait_16_9 / landscape_4_3 / portrait_4_3 / square_hd。
         num_images: 生成数量，1-6 张，默认 2。
+        reference_image_urls: 用户上传的参考素材图片 URL 列表（如 /uploads/xxx.png），生成时将作为角色 / 风格参考输入给模型。
     """
     # ── 画幅提示映射 ──
     size_hints = {
@@ -129,6 +135,26 @@ def generate_reference_images(prompt: str, image_size: str, num_images: int = 2)
     print(f"[Image Gen] Prompt: {prompt[:100]}...")
     print(f"[Image Gen] Size: {image_size} ({aspect_hint}) | Count: {num_images}")
 
+    # ── 读取用户上传的参考素材作为多模态输入 ──
+    _MIME_MAP = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+    }
+    ref_parts: list[types.Part] = []
+    if reference_image_urls:
+        for url in reference_image_urls:
+            filename = url.split("/")[-1]
+            filepath = UPLOAD_DIR / filename
+            if filepath.exists():
+                image_data = filepath.read_bytes()
+                mime = _MIME_MAP.get(filepath.suffix.lower(), "image/png")
+                ref_parts.append(types.Part.from_bytes(data=image_data, mime_type=mime))
+                print(f"[Image Gen] Loaded reference: {filename} ({len(image_data)} bytes)")
+            else:
+                print(f"[Image Gen] Warning: reference file not found: {filepath}")
+    if ref_parts:
+        print(f"[Image Gen] Using {len(ref_parts)} reference image(s) as input")
+
     client = get_image_client()
     image_urls: list[str] = []
 
@@ -138,9 +164,22 @@ def generate_reference_images(prompt: str, image_size: str, num_images: int = 2)
                 f"Generate a high-quality cinematic reference image in {aspect_hint}. "
                 f"{prompt}"
             )
+
+            # ── 构建多模态 contents：参考图 + 文字提示 ──
+            contents: list[types.Part] = []
+            if ref_parts:
+                contents.extend(ref_parts)
+                contents.append(types.Part.from_text(
+                    f"Using the above images as character and style reference, "
+                    f"generate a new image that keeps the same characters' appearance: "
+                    f"{full_prompt}"
+                ))
+            else:
+                contents.append(types.Part.from_text(full_prompt))
+
             response = client.models.generate_content(
                 model=IMAGE_MODEL_NAME,
-                contents=full_prompt,
+                contents=contents,
                 config=types.GenerateContentConfig(
                     response_modalities=["TEXT", "IMAGE"],
                 ),
@@ -303,13 +342,13 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 def get_client() -> genai.Client:
-    """获取 genai Client 实例（首次调用时初始化，采用图片中的 Vertex AI 模式）。"""
+    """获取 genai Client 实例（首次调用时初始化，使用标准 Google AI API）。"""
     global _genai_client
     if _genai_client is None:
         _genai_client = genai.Client(
             vertexai=True,
             api_key=os.getenv("GOOGLE_API_KEY", ""),
-            http_options=types.HttpOptions(api_version='v1'),
+            http_options=types.HttpOptions(api_version='v1')
         )
     return _genai_client
 
@@ -319,9 +358,11 @@ def get_image_client() -> genai.Client:
     global _image_genai_client
     if _image_genai_client is None:
         _image_genai_client = genai.Client(
+            vertexai=True,
             api_key=os.getenv("GOOGLE_API_KEY", ""),
+            http_options=types.HttpOptions(api_version='v1')
         )
-    return _image_genai_client
+    return _image_genai_client  
 
 
 def _build_genai_tool_declarations() -> list[types.Tool]:
