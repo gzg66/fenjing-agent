@@ -20,6 +20,7 @@ import json
 import os
 import threading
 import uuid
+from pathlib import Path
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
@@ -76,7 +77,7 @@ class VideoAgentState(TypedDict):
 # ============================================================
 # 2. 核心工具 (Tools)
 #    - ask_user: 向用户追问缺失信息（Human-in-the-loop）
-#    - generate_reference_images: 模拟 Seedream 4.5 生图
+#    - generate_reference_images: 调用 Gemini 图片生成模型生成参考图
 #    - build_storyboard: 构建结构化分镜脚本
 #    - submit_seedance_task: 模拟 Seedance 2.0 提交视频任务
 # ============================================================
@@ -107,31 +108,87 @@ def ask_user(question: str) -> str:
 
 @tool
 def generate_reference_images(prompt: str, image_size: str, num_images: int = 2) -> str:
-    """调用 Seedream 4.5 API 生成参考图片（当前为 Mock 实现）。
+    """调用 Gemini 图片生成模型生成参考图片。
 
     Args:
         prompt: 英文图片描述，应包含角色外貌、服装、姿势、表情、环境等细节。
         image_size: 图片尺寸。可选值：landscape_16_9 / portrait_16_9 / landscape_4_3 / portrait_4_3 / square_hd。
         num_images: 生成数量，1-6 张，默认 2。
     """
-    # ====== Mock 实现：模拟 Seedream 4.5 API 调用 ======
-    print("\n🎨 [Seedream 4.5 Mock] 生成参考图中...")
-    print(f"   📝 Prompt : {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
-    print(f"   📐 Size   : {image_size}  |  🔢 Count: {num_images}")
+    # ── 画幅提示映射 ──
+    size_hints = {
+        "landscape_16_9": "16:9 landscape wide format",
+        "portrait_16_9": "9:16 portrait tall format",
+        "landscape_4_3": "4:3 landscape format",
+        "portrait_4_3": "3:4 portrait format",
+        "square_hd": "1:1 square format",
+    }
+    aspect_hint = size_hints.get(image_size, "16:9 landscape wide format")
 
-    mock_urls = [
-        f"https://mock-cdn.seedream.ai/img/{uuid.uuid4().hex[:8]}.png"
-        for _ in range(num_images)
-    ]
+    print(f"\n[Image Gen] Model: {IMAGE_MODEL_NAME}")
+    print(f"[Image Gen] Prompt: {prompt[:100]}...")
+    print(f"[Image Gen] Size: {image_size} ({aspect_hint}) | Count: {num_images}")
 
-    print("   ✅ 生成完成！")
-    for i, url in enumerate(mock_urls, 1):
-        print(f"      @image_file_{i} → {url}")
+    client = get_image_client()
+    image_urls: list[str] = []
 
+    for i in range(num_images):
+        try:
+            full_prompt = (
+                f"Generate a high-quality cinematic reference image in {aspect_hint}. "
+                f"{prompt}"
+            )
+            response = client.models.generate_content(
+                model=IMAGE_MODEL_NAME,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["TEXT", "IMAGE"],
+                ),
+            )
+
+            # ── 从响应中提取图片数据 ──
+            found_image = False
+            if response.candidates and response.candidates[0].content:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, "inline_data") and part.inline_data is not None:
+                        # 根据 MIME 类型确定文件扩展名
+                        mime_type = getattr(part.inline_data, "mime_type", "") or "image/png"
+                        ext = ".png"
+                        if "jpeg" in mime_type or "jpg" in mime_type:
+                            ext = ".jpg"
+                        elif "webp" in mime_type:
+                            ext = ".webp"
+
+                        # 保存图片到 uploads 目录
+                        filename = f"gen_{uuid.uuid4().hex[:12]}{ext}"
+                        filepath = UPLOAD_DIR / filename
+                        with open(filepath, "wb") as f:
+                            f.write(part.inline_data.data)
+
+                        url = f"/uploads/{filename}"
+                        image_urls.append(url)
+                        print(f"[Image Gen] Saved image {i + 1}: {filename} ({len(part.inline_data.data)} bytes)")
+                        found_image = True
+                        break  # 每次调用只取第一张图
+
+            if not found_image:
+                print(f"[Image Gen] Warning: No image data in response for image {i + 1}")
+
+        except Exception as e:
+            print(f"[Image Gen] Error generating image {i + 1}: {e}")
+            continue
+
+    if not image_urls:
+        return json.dumps({
+            "status": "error",
+            "message": "图片生成失败，请检查 API Key 和模型配置后重试",
+        }, ensure_ascii=False)
+
+    print(f"[Image Gen] Done, generated {len(image_urls)}/{num_images} images")
     return json.dumps({
         "status": "success",
-        "image_urls": mock_urls,
-        "message": f"已成功生成 {num_images} 张参考图",
+        "image_urls": image_urls,
+        "message": f"已成功生成 {len(image_urls)} 张参考图",
     }, ensure_ascii=False)
 
 
@@ -236,6 +293,14 @@ _genai_client = None
 # 默认使用 gemini-3-flash-preview 模型
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3-flash-preview")
 
+# ── 图片生成模型配置 ──
+IMAGE_MODEL_NAME = os.getenv("IMAGE_MODEL_NAME", "gemini-3-pro-image-preview")
+_image_genai_client = None
+
+# ── 图片保存目录（与 web_server.py 共享） ──
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
 
 def get_client() -> genai.Client:
     """获取 genai Client 实例（首次调用时初始化，采用图片中的 Vertex AI 模式）。"""
@@ -247,6 +312,16 @@ def get_client() -> genai.Client:
             http_options=types.HttpOptions(api_version='v1'),
         )
     return _genai_client
+
+
+def get_image_client() -> genai.Client:
+    """获取图片生成专用 genai Client（使用标准 API，支持 response_modalities=IMAGE）。"""
+    global _image_genai_client
+    if _image_genai_client is None:
+        _image_genai_client = genai.Client(
+            api_key=os.getenv("GOOGLE_API_KEY", ""),
+        )
+    return _image_genai_client
 
 
 def _build_genai_tool_declarations() -> list[types.Tool]:
@@ -578,7 +653,7 @@ def tool_node(state: VideoAgentState) -> dict:
                 state_updates["style"] = tool_args["style"]
 
         elif tool_name == "generate_reference_images":
-            # 解析 Mock 返回的图片 URL 列表，追加到已有参考图中
+            # 解析图片生成返回的 URL 列表，追加到已有参考图中
             try:
                 data = json.loads(result)
                 new_urls = data.get("image_urls", [])
