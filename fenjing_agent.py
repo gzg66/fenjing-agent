@@ -461,11 +461,187 @@ def submit_seedance_task(
     }, ensure_ascii=False)
 
 
+@tool
+def submit_kling_video_task(
+    prompt: str,
+    negative_prompt: str = "",
+    image_files: list[str] | None = None,
+    duration: str = "15",
+    cfg_scale: float = 0.5,
+    sound: bool = True,
+) -> str:
+    """调用 RunningHub Kling V3.0 Pro 图生视频 API，根据首帧图片和 Prompt 生成视频。
+    工具会自动轮询任务状态，直到视频生成完成或超时。
+
+    Args:
+        prompt: 视频生成的提示词，描述视频内容、场景、动作、对白等。
+        negative_prompt: 负面提示词，描述不想在视频中出现的内容，可为空。
+        image_files: 参考图片 URL 列表（第一张将作为首帧图输入），如 /uploads/gen_xxx.png。
+        duration: 视频时长（秒），可选 "5" / "10" / "15"，默认 "15"。
+        cfg_scale: CFG Scale 参数，控制生成一致性，范围 0-1，默认 0.5。
+        sound: 是否生成声音，默认为 True。
+    """
+    image_files = image_files or []
+
+    # ── 检查 API Key ──
+    api_key = RUNNINGHUB_API_KEY or os.getenv("RUNNINGHUB_API_KEY", "")
+    if not api_key:
+        return json.dumps({
+            "status": "error",
+            "message": "未配置 RUNNINGHUB_API_KEY 环境变量，无法提交视频生成任务",
+        }, ensure_ascii=False)
+
+    # ── 获取首帧图片并转为 Base64 data URI ──
+    if not image_files:
+        return json.dumps({
+            "status": "error",
+            "message": "缺少首帧参考图片，请先通过 generate_reference_images 生成首帧图",
+        }, ensure_ascii=False)
+
+    first_image_url = image_files[0]
+    filename = first_image_url.split("/")[-1]
+    filepath = UPLOAD_DIR / filename
+    if not filepath.exists():
+        return json.dumps({
+            "status": "error",
+            "message": f"首帧图片文件不存在: {filepath}",
+        }, ensure_ascii=False)
+
+    print(f"\n[Kling V3.0 Pro] Converting first-frame image to Base64: {filename}")
+    image_base64 = _image_to_base64_uri(str(filepath))
+    print(f"[Kling V3.0 Pro] Base64 length: {len(image_base64)} chars")
+
+    # ── 构建请求 ──
+    submit_url = f"{RUNNINGHUB_API_BASE}/kling-v3.0-pro/image-to-video"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "prompt": prompt,
+        "negativePrompt": negative_prompt,
+        "firstImageUrl": image_base64,
+        "lastImageUrl": "",
+        "duration": str(duration),
+        "cfgScale": cfg_scale,
+        "sound": sound,
+    }
+
+    print(f"[Kling V3.0 Pro] Submitting video generation task...")
+    print(f"[Kling V3.0 Pro] Duration: {duration}s | CFG Scale: {cfg_scale} | Sound: {sound}")
+    print(f"[Kling V3.0 Pro] Image files: {len(image_files)} | First frame: {filename}")
+
+    # ── 提交任务 ──
+    begin = time.time()
+    try:
+        response = requests.post(submit_url, headers=headers, json=payload, timeout=60)
+        if response.status_code != 200:
+            return json.dumps({
+                "status": "error",
+                "message": f"提交失败: HTTP {response.status_code}, {response.text[:500]}",
+            }, ensure_ascii=False)
+
+        result = response.json()
+        task_id = result.get("taskId")
+        if not task_id:
+            return json.dumps({
+                "status": "error",
+                "message": f"提交失败: 未获取到 taskId, 响应: {json.dumps(result, ensure_ascii=False)[:500]}",
+            }, ensure_ascii=False)
+
+        print(f"[Kling V3.0 Pro] Task submitted successfully. ID: {task_id}")
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"提交请求异常: {e}",
+        }, ensure_ascii=False)
+
+    # ── 轮询任务状态，直到完成或超时 ──
+    query_url = f"{RUNNINGHUB_API_BASE}/query"
+    max_wait = 600      # 最长等待 10 分钟
+    poll_interval = 5   # 每 5 秒查询一次
+    elapsed = 0
+
+    while elapsed < max_wait:
+        time.sleep(poll_interval)
+        elapsed = int(time.time() - begin)
+
+        try:
+            resp = requests.post(
+                query_url, headers=headers,
+                json={"taskId": task_id}, timeout=15,
+            )
+            if resp.status_code != 200:
+                print(f"[Kling V3.0 Pro] Query error: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            status = data.get("status", "UNKNOWN")
+
+            if status == "SUCCESS":
+                video_url = ""
+                if data.get("results") and len(data["results"]) > 0:
+                    video_url = data["results"][0].get("url", "")
+
+                print(f"[Kling V3.0 Pro] Task completed in ~{elapsed}s. Video URL: {video_url}")
+
+                # ── 下载视频到本地 uploads 目录 ──
+                local_video_path = ""
+                if video_url:
+                    try:
+                        video_filename = f"video_kling_{task_id}.mp4"
+                        video_filepath = UPLOAD_DIR / video_filename
+                        print(f"[Kling V3.0 Pro] Downloading video to {video_filename}...")
+                        video_resp = requests.get(video_url, timeout=120)
+                        if video_resp.status_code == 200:
+                            with open(video_filepath, "wb") as f:
+                                f.write(video_resp.content)
+                            local_video_path = f"/uploads/{video_filename}"
+                            print(f"[Kling V3.0 Pro] Video saved: {video_filename} ({len(video_resp.content)} bytes)")
+                        else:
+                            print(f"[Kling V3.0 Pro] Download failed: HTTP {video_resp.status_code}")
+                    except Exception as dl_err:
+                        print(f"[Kling V3.0 Pro] Warning: Failed to download video: {dl_err}")
+
+                return json.dumps({
+                    "status": "success",
+                    "task_id": task_id,
+                    "video_url": video_url,
+                    "local_video_path": local_video_path,
+                    "elapsed_seconds": elapsed,
+                    "message": f"视频生成完成! 耗时约 {elapsed} 秒。",
+                }, ensure_ascii=False)
+
+            elif status in ("RUNNING", "QUEUED"):
+                print(f"[Kling V3.0 Pro] Status: {status} (waited {elapsed}s / {max_wait}s)")
+                continue
+
+            else:
+                error_msg = data.get("errorMessage", "未知错误")
+                print(f"[Kling V3.0 Pro] Task failed: {error_msg}")
+                return json.dumps({
+                    "status": "error",
+                    "task_id": task_id,
+                    "message": f"视频生成失败: {error_msg}",
+                }, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"[Kling V3.0 Pro] Query exception: {e}")
+            continue
+
+    # ── 超时 ──
+    return json.dumps({
+        "status": "timeout",
+        "task_id": task_id,
+        "message": f"视频生成超时 (等待超过 {max_wait} 秒)，任务 ID: {task_id}，可稍后手动查询。",
+    }, ensure_ascii=False)
+
+
 # ============================================================
 # 3. 工具注册 & Gemini 客户端延迟初始化
 # ============================================================
 
-TOOLS = [ask_user, generate_reference_images, build_storyboard, submit_seedance_task]
+TOOLS = [ask_user, generate_reference_images, build_storyboard, submit_seedance_task, submit_kling_video_task]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 # 延迟初始化：避免导入模块时就校验 API Key，仅在实际运行时创建客户端
@@ -746,12 +922,23 @@ The atmosphere is warm, festive, and magical with volumetric golden lighting.
 ```
 
 ### 步骤六：提交视频生成任务
-分镜和首帧图都确认无误后，调用 `submit_seedance_task` 工具将分镜脚本和首帧参考图提交给 RunningHub 图生视频 API。
+分镜和首帧图都确认无误后，根据需要选择以下两种视频生成工具之一：
+
+**方案 A — `submit_seedance_task`（Seedance / Wan 2.6 模型）：**
 - `prompt`：传入完整的分镜脚本文本（build_storyboard 的输出）
 - `image_files`：传入首帧参考图 URL 列表（第一张将作为视频首帧）
 - `ratio` 和 `duration`：与分镜一致
-- 工具会自动提交任务并轮询等待结果（最长 10 分钟），返回生成的视频下载链接
-- 生成完成后将视频链接展示给用户
+
+**方案 B — `submit_kling_video_task`（Kling V3.0 Pro 模型，推荐用于高质量真人/实拍风格视频）：**
+- `prompt`：传入完整的分镜脚本文本（build_storyboard 的输出）
+- `negative_prompt`：不想出现的内容（可为空）
+- `image_files`：传入首帧参考图 URL 列表（第一张将作为视频首帧）
+- `duration`：视频时长，可选 "5" / "10" / "15"（默认 "15"）
+- `cfg_scale`：一致性控制（0-1，默认 0.5）
+- `sound`：是否生成声音（默认 True）
+
+两种工具都会自动提交任务并轮询等待结果（最长 10 分钟），返回生成的视频下载链接。
+生成完成后将视频链接展示给用户。
 
 ## 分镜模板参考
 
@@ -898,6 +1085,14 @@ def tool_node(state: VideoAgentState) -> dict:
 
         elif tool_name == "submit_seedance_task":
             # 保存视频生成任务 ID
+            try:
+                data = json.loads(result)
+                state_updates["video_task_id"] = data.get("task_id", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        elif tool_name == "submit_kling_video_task":
+            # 保存 Kling 视频生成任务 ID
             try:
                 data = json.loads(result)
                 state_updates["video_task_id"] = data.get("task_id", "")
