@@ -16,12 +16,17 @@
   3. uv run python fenjing_agent.py
 """
 
+import base64
 import json
+import mimetypes
 import os
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Annotated, TypedDict
+
+import requests
 
 from dotenv import load_dotenv
 from google import genai
@@ -79,7 +84,7 @@ class VideoAgentState(TypedDict):
 #    - ask_user: 向用户追问缺失信息（Human-in-the-loop）
 #    - generate_reference_images: 调用 Gemini 图片生成模型生成参考图
 #    - build_storyboard: 构建结构化分镜脚本
-#    - submit_seedance_task: 模拟 Seedance 2.0 提交视频任务
+#    - submit_seedance_task: 调用 RunningHub API 图生视频
 # ============================================================
 
 @tool
@@ -170,12 +175,14 @@ def generate_reference_images(
             if ref_parts:
                 contents.extend(ref_parts)
                 contents.append(types.Part.from_text(
-                    f"Using the above images as character and style reference, "
-                    f"generate a new image that keeps the same characters' appearance: "
-                    f"{full_prompt}"
+                    text=(
+                        f"Using the above images as character and style reference, "
+                        f"generate a new image that keeps the same characters' appearance: "
+                        f"{full_prompt}"
+                    )
                 ))
             else:
-                contents.append(types.Part.from_text(full_prompt))
+                contents.append(types.Part.from_text(text=full_prompt))
 
             response = client.models.generate_content(
                 model=IMAGE_MODEL_NAME,
@@ -285,37 +292,172 @@ def submit_seedance_task(
     video_files: list[str] | None = None,
     audio_files: list[str] | None = None,
 ) -> str:
-    """将最终分镜 Prompt 和参考素材提交到 Seedance 2.0 API 生成视频（当前为 Mock 实现）。
+    """将最终分镜 Prompt 和首帧参考图提交到 RunningHub 图生视频 API 生成视频。
+    工具会自动轮询任务状态，直到视频生成完成或超时。
 
     Args:
         prompt: 完整的分镜 Prompt 文本（来自 build_storyboard 的输出）。
         ratio: 画幅比例 (16:9 / 9:16 / 1:1 / 21:9 / 4:3 / 3:4)。
         duration: 视频时长（4-15 秒）。
-        image_files: 参考图片 URL 列表（可选，最多 9 张）。
-        video_files: 参考视频 URL 列表（可选，最多 3 个）。
-        audio_files: 参考音频 URL 列表（可选，最多 3 个）。
+        image_files: 参考图片 URL 列表（第一张将作为首帧图输入），如 /uploads/gen_xxx.png。
+        video_files: 参考视频 URL 列表（可选，当前未使用）。
+        audio_files: 参考音频 URL 列表（可选，当前未使用）。
     """
     image_files = image_files or []
     video_files = video_files or []
     audio_files = audio_files or []
 
-    # ====== Mock 实现：模拟 Seedance 2.0 API 调用 ======
-    task_id = f"seedance-{uuid.uuid4().hex[:12]}"
+    # ── 检查 API Key ──
+    api_key = RUNNINGHUB_API_KEY or os.getenv("RUNNINGHUB_API_KEY", "")
+    if not api_key:
+        return json.dumps({
+            "status": "error",
+            "message": "未配置 RUNNINGHUB_API_KEY 环境变量，无法提交视频生成任务",
+        }, ensure_ascii=False)
 
-    print("\n🎬 [Seedance 2.0 Mock] 提交视频生成任务...")
-    print(f"   🆔 Task ID  : {task_id}")
-    print(f"   📐 画幅     : {ratio}")
-    print(f"   ⏱️  时长     : {duration}秒")
-    print(f"   🖼️  图片素材 : {len(image_files)} 张")
-    print(f"   🎥 视频素材 : {len(video_files)} 个")
-    print(f"   🔊 音频素材 : {len(audio_files)} 个")
-    print("   ✅ 任务已成功提交！预计 3-5 分钟生成完成。")
+    # ── 获取首帧图片并转为 Base64 data URI ──
+    if not image_files:
+        return json.dumps({
+            "status": "error",
+            "message": "缺少首帧参考图片，请先通过 generate_reference_images 生成首帧图",
+        }, ensure_ascii=False)
 
+    first_image_url = image_files[0]
+    filename = first_image_url.split("/")[-1]
+    filepath = UPLOAD_DIR / filename
+    if not filepath.exists():
+        return json.dumps({
+            "status": "error",
+            "message": f"首帧图片文件不存在: {filepath}",
+        }, ensure_ascii=False)
+
+    print(f"\n[RunningHub] Converting first-frame image to Base64: {filename}")
+    image_base64 = _image_to_base64_uri(str(filepath))
+    print(f"[RunningHub] Base64 length: {len(image_base64)} chars")
+
+    # ── 构建请求 ──
+    submit_url = f"{RUNNINGHUB_API_BASE}/alibaba/wan-2.6/image-to-video"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    resolution = "720p"
+    payload = {
+        "imageUrl": image_base64,
+        "prompt": prompt,
+        "negativePrompt": "",
+        "resolution": resolution,
+        "duration": str(duration),
+        "shotType": "multi",
+    }
+
+    print(f"[RunningHub] Submitting video generation task...")
+    print(f"[RunningHub] Ratio: {ratio} | Duration: {duration}s | Resolution: {resolution}")
+    print(f"[RunningHub] Image files: {len(image_files)} | First frame: {filename}")
+
+    # ── 提交任务 ──
+    try:
+        response = requests.post(submit_url, headers=headers, json=payload, timeout=60)
+        if response.status_code != 200:
+            return json.dumps({
+                "status": "error",
+                "message": f"提交失败: HTTP {response.status_code}, {response.text[:500]}",
+            }, ensure_ascii=False)
+
+        result = response.json()
+        task_id = result.get("taskId")
+        if not task_id:
+            return json.dumps({
+                "status": "error",
+                "message": f"提交失败: 未获取到 taskId, 响应: {json.dumps(result, ensure_ascii=False)[:500]}",
+            }, ensure_ascii=False)
+
+        print(f"[RunningHub] Task submitted successfully. ID: {task_id}")
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"提交请求异常: {e}",
+        }, ensure_ascii=False)
+
+    # ── 轮询任务状态，直到完成或超时 ──
+    query_url = f"{RUNNINGHUB_API_BASE}/query"
+    max_wait = 600      # 最长等待 10 分钟
+    poll_interval = 5   # 每 5 秒查询一次
+    elapsed = 0
+    begin = time.time()
+
+    while elapsed < max_wait:
+        time.sleep(poll_interval)
+        elapsed = int(time.time() - begin)
+
+        try:
+            resp = requests.post(
+                query_url, headers=headers,
+                json={"taskId": task_id}, timeout=15,
+            )
+            if resp.status_code != 200:
+                print(f"[RunningHub] Query error: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            status = data.get("status", "UNKNOWN")
+
+            if status == "SUCCESS":
+                video_url = ""
+                if data.get("results") and len(data["results"]) > 0:
+                    video_url = data["results"][0].get("url", "")
+
+                print(f"[RunningHub] Task completed in ~{elapsed}s. Video URL: {video_url}")
+
+                # ── 下载视频到本地 uploads 目录 ──
+                local_video_path = ""
+                if video_url:
+                    try:
+                        video_filename = f"video_{task_id}.mp4"
+                        video_filepath = UPLOAD_DIR / video_filename
+                        print(f"[RunningHub] Downloading video to {video_filename}...")
+                        video_resp = requests.get(video_url, timeout=120)
+                        if video_resp.status_code == 200:
+                            with open(video_filepath, "wb") as f:
+                                f.write(video_resp.content)
+                            local_video_path = f"/uploads/{video_filename}"
+                            print(f"[RunningHub] Video saved: {video_filename} ({len(video_resp.content)} bytes)")
+                        else:
+                            print(f"[RunningHub] Download failed: HTTP {video_resp.status_code}")
+                    except Exception as dl_err:
+                        print(f"[RunningHub] Warning: Failed to download video: {dl_err}")
+
+                return json.dumps({
+                    "status": "success",
+                    "task_id": task_id,
+                    "video_url": video_url,
+                    "local_video_path": local_video_path,
+                    "elapsed_seconds": elapsed,
+                    "message": f"视频生成完成! 耗时约 {elapsed} 秒。",
+                }, ensure_ascii=False)
+
+            elif status in ("RUNNING", "QUEUED"):
+                print(f"[RunningHub] Status: {status} (waited {elapsed}s / {max_wait}s)")
+                continue
+
+            else:
+                error_msg = data.get("errorMessage", "未知错误")
+                print(f"[RunningHub] Task failed: {error_msg}")
+                return json.dumps({
+                    "status": "error",
+                    "task_id": task_id,
+                    "message": f"视频生成失败: {error_msg}",
+                }, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"[RunningHub] Query exception: {e}")
+            continue
+
+    # ── 超时 ──
     return json.dumps({
-        "status": "submitted",
+        "status": "timeout",
         "task_id": task_id,
-        "estimated_time": "3-5 minutes",
-        "message": f"视频生成任务已成功提交，Task ID: {task_id}",
+        "message": f"视频生成超时 (等待超过 {max_wait} 秒)，任务 ID: {task_id}，可稍后手动查询。",
     }, ensure_ascii=False)
 
 
@@ -336,9 +478,21 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3-flash-preview")
 IMAGE_MODEL_NAME = os.getenv("IMAGE_MODEL_NAME", "gemini-3-pro-image-preview")
 _image_genai_client = None
 
-# ── 图片保存目录（与 web_server.py 共享） ──
+# ── 图片/视频保存目录（与 web_server.py 共享） ──
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ── RunningHub 图生视频 API 配置 ──
+RUNNINGHUB_API_KEY = os.getenv("RUNNINGHUB_API_KEY", "")
+RUNNINGHUB_API_BASE = "https://www.runninghub.cn/openapi/v2"
+
+
+def _image_to_base64_uri(image_path: str) -> str:
+    """将本地图片文件转换为 Base64 data URI 格式（用于 RunningHub API）。"""
+    mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:{mime_type};base64,{b64}"
 
 
 def get_client() -> genai.Client:
@@ -418,42 +572,60 @@ def _messages_to_genai(messages: list[BaseMessage]) -> list[types.Content]:
     映射规则：
       HumanMessage  → role="user",  Part(text=...)
       AIMessage     → role="model", Part(text=...) / Part(function_call=...)
-      ToolMessage   → Part(function_response=...)
+      ToolMessage   → Part(function_response=...)  ※ 连续的合并为同一 Content
       SystemMessage → 跳过（通过 config.system_instruction 传递）
+
+    重要：Gemini API 要求同一轮所有 function_response 合并在一个 Content 中，
+    数量必须等于对应 function_call 的数量，否则报 400 INVALID_ARGUMENT。
     """
     contents: list[types.Content] = []
+    # ── 缓冲区：累积连续的 ToolMessage 对应的 function_response Parts ──
+    pending_tool_parts: list[types.Part] = []
+
+    def _flush_tool_parts():
+        """将累积的 function_response Parts 合并为一个 Content 并清空缓冲。"""
+        if pending_tool_parts:
+            contents.append(types.Content(parts=list(pending_tool_parts)))
+            pending_tool_parts.clear()
+
     for msg in messages:
-        if isinstance(msg, HumanMessage):
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=str(msg.content))],
-            ))
-        elif isinstance(msg, AIMessage):
-            # ── 优先使用原始 genai Content（保留 thought_signature 等元数据）──
-            original = msg.additional_kwargs.get("_genai_content")
-            if original is not None:
-                contents.append(original)
-            else:
-                # 如果没有原始 Content（如手工构造的 AIMessage），则从字段重构
-                parts: list[types.Part] = []
-                if msg.content:
-                    parts.append(types.Part.from_text(text=str(msg.content)))
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        parts.append(types.Part.from_function_call(
-                            name=tc["name"], args=tc["args"],
-                        ))
-                if parts:
-                    contents.append(types.Content(role="model", parts=parts))
-        elif isinstance(msg, ToolMessage):
-            # 工具返回结果 → genai function_response
+        if isinstance(msg, ToolMessage):
+            # 累积 function_response，不立即 append
             fn_name = getattr(msg, "name", None) or "unknown"
-            contents.append(types.Content(
-                parts=[types.Part.from_function_response(
-                    name=fn_name,
-                    response={"result": str(msg.content)},
-                )],
+            pending_tool_parts.append(types.Part.from_function_response(
+                name=fn_name,
+                response={"result": str(msg.content)},
             ))
+        else:
+            # 遇到非 ToolMessage 时先刷出缓冲的工具结果
+            _flush_tool_parts()
+
+            if isinstance(msg, HumanMessage):
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=str(msg.content))],
+                ))
+            elif isinstance(msg, AIMessage):
+                # ── 优先使用原始 genai Content（保留 thought_signature 等元数据）──
+                original = msg.additional_kwargs.get("_genai_content")
+                if original is not None:
+                    contents.append(original)
+                else:
+                    # 如果没有原始 Content（如手工构造的 AIMessage），则从字段重构
+                    parts: list[types.Part] = []
+                    if msg.content:
+                        parts.append(types.Part.from_text(text=str(msg.content)))
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            parts.append(types.Part.from_function_call(
+                                name=tc["name"], args=tc["args"],
+                            ))
+                    if parts:
+                        contents.append(types.Content(role="model", parts=parts))
+
+    # 消息列表末尾可能还有未刷出的 ToolMessage
+    _flush_tool_parts()
+
     return contents
 
 
@@ -550,15 +722,36 @@ SYSTEM_PROMPT = """\
 ⚠️ 在用户确认分镜脚本之前，**绝对不能**生成参考图或提交视频任务。
 
 ### 步骤五：生成首帧参考图
-用户确认分镜脚本后，如果用户没有现成素材，调用 `generate_reference_images` 工具为分镜中的角色和场景生成首帧参考图。
-- 提示词使用英文效果更佳
-- 图片尺寸需与视频画幅匹配：
-  16:9 → landscape_16_9 | 9:16 → portrait_16_9 | 1:1 → square_hd
-  4:3 → landscape_4_3   | 3:4 → portrait_4_3   | 21:9 → landscape_16_9
-- 生成后将图片展示给用户确认，并在分镜中标注引用（使用 @image_file_N 格式）
+用户确认分镜脚本后，调用 `generate_reference_images` 工具生成视频的**首帧图片**。
 
-### 步骤六：提交视频任务
-分镜和首帧图都确认无误后，调用 `submit_seedance_task` 工具将分镜脚本和参考素材提交给 Seedance 2.0。
+**首帧图的生成逻辑（必须严格遵守）：**
+1. **prompt（英文）** 必须包含以下三部分内容的融合描述：
+   - 分镜脚本的**第一段时间轴**内容（例如 0-3 秒的画面描述：镜头运动、场景、主体动作）
+   - 分镜的**视觉风格**（如 3D 动画、写实、水墨等）
+   - 角色的外貌特征描述（基于用户提供的信息）
+2. **reference_image_urls** 必须传入用户上传的**所有**参考素材（包括角色图和场景图），让模型参考这些图片的人物外貌和场景风格来生成首帧
+3. **image_size** 需与视频画幅匹配：
+   16:9 → landscape_16_9 | 9:16 → portrait_16_9 | 1:1 → square_hd
+   4:3 → landscape_4_3   | 3:4 → portrait_4_3   | 21:9 → landscape_16_9
+4. **num_images** 设为 1（首帧只需要一张）
+5. 生成后将图片展示给用户确认，并在分镜中标注引用（使用 @image_file_N 格式）
+
+**示例 prompt 格式：**
+```
+3D cartoon animation style. A panoramic establishing shot from a high angle overlooking
+a magnificent ancient Chinese town during the Lantern Festival. Thousands of glowing red
+lanterns hang like a sea of stars. Fireworks burst in the distant sky. A small cute book
+spirit character (as shown in the reference image) flies into the frame from below.
+The atmosphere is warm, festive, and magical with volumetric golden lighting.
+```
+
+### 步骤六：提交视频生成任务
+分镜和首帧图都确认无误后，调用 `submit_seedance_task` 工具将分镜脚本和首帧参考图提交给 RunningHub 图生视频 API。
+- `prompt`：传入完整的分镜脚本文本（build_storyboard 的输出）
+- `image_files`：传入首帧参考图 URL 列表（第一张将作为视频首帧）
+- `ratio` 和 `duration`：与分镜一致
+- 工具会自动提交任务并轮询等待结果（最长 10 分钟），返回生成的视频下载链接
+- 生成完成后将视频链接展示给用户
 
 ## 分镜模板参考
 

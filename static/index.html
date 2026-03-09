@@ -463,6 +463,56 @@ body {
 .state-item .value { color: var(--text); font-weight: 500; }
 .state-item .value.empty { color: #94a3b8; font-weight: 400; }
 
+/* ── 生成图片画廊 ── */
+.gen-image-gallery {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  margin-top: 10px;
+}
+.gen-image {
+  max-width: 280px; max-height: 200px;
+  border-radius: 10px;
+  box-shadow: var(--shadow-md);
+  cursor: zoom-in;
+  transition: transform .2s, box-shadow .2s;
+  object-fit: cover;
+}
+.gen-image:hover {
+  transform: scale(1.03);
+  box-shadow: var(--shadow-lg);
+}
+
+/* ── 生成的视频播放器 ── */
+.gen-video-wrap {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.gen-video {
+  max-width: 480px;
+  width: 100%;
+  border-radius: 10px;
+  box-shadow: var(--shadow-md);
+  background: #000;
+}
+.video-download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--primary);
+  background: rgba(79, 70, 229, .08);
+  border: 1px solid rgba(79, 70, 229, .2);
+  border-radius: 8px;
+  text-decoration: none;
+  transition: background .2s;
+}
+.video-download-btn:hover {
+  background: rgba(79, 70, 229, .15);
+}
+
 /* ── 图片预览弹窗 ── */
 .lightbox {
   position: fixed; inset: 0;
@@ -760,6 +810,18 @@ async function startSSEStream(text, fileUrls) {
             updateStepToggle(sc._toggle, curStepCount);
             curProgress.querySelector('.progress-text').textContent = '处理中...';
             sc._stepList.appendChild(curProgress);
+
+            // ── 如果有生成的图片，在聊天区域直接展示 ──
+            if (data.image_urls && data.image_urls.length > 0) {
+              finalizeContainer();
+              addImageGallery(data.image_urls);
+            }
+
+            // ── 如果有生成的视频，在聊天区域展示视频播放器 ──
+            if (data.local_video_path || data.video_url) {
+              finalizeContainer();
+              addVideoPlayer(data.local_video_path || data.video_url);
+            }
             break;
           }
 
@@ -925,6 +987,79 @@ function addToolResultCard(parent, name, content) {
   scrollToBottom();
 }
 
+function addImageGallery(imageUrls) {
+  const div = document.createElement('div');
+  div.className = 'message agent';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = '🤖';
+
+  const contentWrap = document.createElement('div');
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = '<strong>🖼️ 已生成参考图片</strong>（点击图片可放大）';
+  contentWrap.appendChild(bubble);
+
+  const gallery = document.createElement('div');
+  gallery.className = 'gen-image-gallery';
+  for (const url of imageUrls) {
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = '生成的参考图';
+    img.className = 'gen-image';
+    img.onclick = () => openLightbox(url);
+    gallery.appendChild(img);
+  }
+  contentWrap.appendChild(gallery);
+
+  div.appendChild(avatar);
+  div.appendChild(contentWrap);
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
+function addVideoPlayer(videoUrl) {
+  const div = document.createElement('div');
+  div.className = 'message agent';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = '🤖';
+
+  const contentWrap = document.createElement('div');
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = '<strong>🎬 视频生成完成</strong>';
+  contentWrap.appendChild(bubble);
+
+  const videoWrap = document.createElement('div');
+  videoWrap.className = 'gen-video-wrap';
+  const video = document.createElement('video');
+  video.src = videoUrl;
+  video.controls = true;
+  video.preload = 'metadata';
+  video.className = 'gen-video';
+  videoWrap.appendChild(video);
+
+  // 下载按钮
+  const dlLink = document.createElement('a');
+  dlLink.href = videoUrl;
+  dlLink.download = '';
+  dlLink.className = 'video-download-btn';
+  dlLink.textContent = '⬇ 下载视频';
+  videoWrap.appendChild(dlLink);
+
+  contentWrap.appendChild(videoWrap);
+
+  div.appendChild(avatar);
+  div.appendChild(contentWrap);
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
 function addErrorCard(parent, content) {
   const card = document.createElement('div');
   card.className = 'step-card step-error';
@@ -952,6 +1087,37 @@ function createProgressIndicator(text) {
 // ============================================================
 // 消息气泡
 // ============================================================
+/**
+ * 预处理 Agent 回复文本：将 @image_file_N: /uploads/xxx.ext 引用转为 Markdown 图片语法，
+ * 同时收集所有图片 URL 用于在消息下方渲染大图画廊。
+ */
+function preprocessAgentText(text) {
+  if (!text) return { text: '', imageUrls: [] };
+  const imageUrls = [];
+
+  // 匹配 @image_file_N: /uploads/xxx.ext 或 @image_file_N：/uploads/xxx.ext
+  // 后面可能带括号描述，如 (融合了xxx)
+  let processed = text.replace(
+    /@image_file_\d+\s*[:：]\s*(\/uploads\/[^\s\)）]+(?:\.png|\.jpg|\.jpeg|\.webp|\.gif))/gi,
+    (match, url) => {
+      imageUrls.push(url);
+      return ''; // 从文本中移除引用，图片统一在下方画廊展示
+    }
+  );
+
+  // 也捕获独立出现的 /uploads/gen_xxx.ext 路径（未被 @image_file 包裹）
+  processed = processed.replace(
+    /(?<![(@\w])\/uploads\/(gen_[a-f0-9]+(?:\.png|\.jpg|\.jpeg|\.webp|\.gif))/gi,
+    (match, filename) => {
+      const url = '/uploads/' + filename;
+      if (!imageUrls.includes(url)) imageUrls.push(url);
+      return ''; // 移除路径文本
+    }
+  );
+
+  return { text: processed.trim(), imageUrls };
+}
+
 function addMessage(role, text, images) {
   const div = document.createElement('div');
   div.className = 'message ' + role;
@@ -965,26 +1131,38 @@ function addMessage(role, text, images) {
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
 
+  let extractedImages = [];
+
   if (role === 'agent' && typeof marked !== 'undefined') {
-    bubble.innerHTML = marked.parse(text || '');
+    // 预处理：提取图片引用，清理文本
+    const result = preprocessAgentText(text || '');
+    extractedImages = result.imageUrls;
+    bubble.innerHTML = marked.parse(result.text);
+    // 让 Markdown 中已有的 <img> 也可点击放大
+    bubble.querySelectorAll('img').forEach(img => {
+      img.style.cursor = 'zoom-in';
+      img.onclick = (e) => { e.preventDefault(); openLightbox(img.src); };
+    });
   } else {
     bubble.textContent = text || '';
   }
 
   contentWrap.appendChild(bubble);
 
-  // 图片
-  if (images && images.length > 0) {
-    const imgWrap = document.createElement('div');
-    imgWrap.className = 'msg-images';
-    for (const src of images) {
+  // 合并：手动传入的图片 + 从文本中提取的图片
+  const allImages = [...(images || []), ...extractedImages];
+  if (allImages.length > 0) {
+    const gallery = document.createElement('div');
+    gallery.className = 'gen-image-gallery';
+    for (const src of allImages) {
       const img = document.createElement('img');
       img.src = src;
       img.alt = '参考图';
+      img.className = 'gen-image';
       img.onclick = () => openLightbox(src);
-      imgWrap.appendChild(img);
+      gallery.appendChild(img);
     }
-    contentWrap.appendChild(imgWrap);
+    contentWrap.appendChild(gallery);
   }
 
   div.appendChild(avatar);

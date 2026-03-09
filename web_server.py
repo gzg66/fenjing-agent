@@ -159,9 +159,33 @@ class AgentSession:
                             # ask_user 结果不推送 (其内容已通过 question 事件展示)
                             if msg.name == "ask_user":
                                 continue
+
+                            # ── 图片生成结果：提取 image_urls 供前端渲染 ──
+                            image_urls = []
+                            if msg.name == "generate_reference_images":
+                                try:
+                                    data = json.loads(str(msg.content))
+                                    image_urls = data.get("image_urls", [])
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+
+                            # ── 视频生成结果：提取 video_url / local_video_path ──
+                            video_url = ""
+                            local_video_path = ""
+                            if msg.name == "submit_seedance_task":
+                                try:
+                                    data = json.loads(str(msg.content))
+                                    video_url = data.get("video_url", "")
+                                    local_video_path = data.get("local_video_path", "")
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+
                             put(sse("tool_result", {
                                 "name": msg.name,
-                                "content": str(msg.content)[:500],
+                                "content": str(msg.content)[:800],
+                                "image_urls": image_urls,
+                                "video_url": video_url,
+                                "local_video_path": local_video_path,
                             }))
 
             put(sse("done", {}))
