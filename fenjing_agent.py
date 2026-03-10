@@ -63,6 +63,38 @@ def clear_web_ask_callback():
 
 
 # ============================================================
+# 视频任务异步执行支持 (后台轮询)
+# ============================================================
+_video_tasks: dict[str, dict] = {}       # task_id -> 状态字典
+_video_task_lock = threading.Lock()
+_video_done_callbacks: dict[str, callable] = {}  # task_id -> callback
+
+
+def get_video_task_status(task_id: str) -> dict | None:
+    """查询后台视频任务的当前状态。"""
+    with _video_task_lock:
+        task = _video_tasks.get(task_id)
+        return task.copy() if task else None
+
+
+def register_video_done_callback(task_id: str, callback):
+    """注册视频任务完成回调。callback(task_id: str, result: dict)"""
+    _video_done_callbacks[task_id] = callback
+
+
+def _fire_video_callback(task_id: str):
+    """触发视频任务完成回调并移除。"""
+    cb = _video_done_callbacks.pop(task_id, None)
+    if cb:
+        try:
+            with _video_task_lock:
+                result = _video_tasks.get(task_id, {}).copy()
+            cb(task_id, result)
+        except Exception as e:
+            print(f"[VideoCallback] Error: {e}")
+
+
+# ============================================================
 # 1. 状态定义 (State)
 #    - messages：使用 add_messages reducer，自动追加消息
 #    - 其余业务字段：使用"最新值覆盖"策略，追踪工作流进度
@@ -295,7 +327,7 @@ def submit_seedance_task(
     audio_files: list[str] | None = None,
 ) -> str:
     """将最终分镜 Prompt 和首帧参考图提交到 RunningHub 图生视频 API 生成视频。
-    工具会自动轮询任务状态，直到视频生成完成或超时。
+    任务提交后立即返回，视频在后台异步生成，完成后自动通知用户。
 
     Args:
         prompt: 完整的分镜 Prompt 文本（来自 build_storyboard 的输出）。
@@ -382,85 +414,26 @@ def submit_seedance_task(
             "message": f"提交请求异常: {e}",
         }, ensure_ascii=False)
 
-    # ── 轮询任务状态，直到完成或超时 ──
-    query_url = f"{RUNNINGHUB_API_BASE}/query"
-    max_wait = 600      # 最长等待 10 分钟
-    poll_interval = 5   # 每 5 秒查询一次
-    elapsed = 0
-    begin = time.time()
+    # ── 注册任务并启动后台轮询（异步，不阻塞对话） ──
+    with _video_task_lock:
+        _video_tasks[task_id] = {
+            "status": "running",
+            "task_id": task_id,
+            "message": "视频正在生成中...",
+            "elapsed_seconds": 0,
+        }
 
-    while elapsed < max_wait:
-        time.sleep(poll_interval)
-        elapsed = int(time.time() - begin)
+    threading.Thread(
+        target=_poll_video_task_bg,
+        args=(task_id, RUNNINGHUB_API_BASE, api_key, "seedance"),
+        daemon=True,
+    ).start()
 
-        try:
-            resp = requests.post(
-                query_url, headers=headers,
-                json={"taskId": task_id}, timeout=15,
-            )
-            if resp.status_code != 200:
-                print(f"[RunningHub] Query error: HTTP {resp.status_code}")
-                continue
-
-            data = resp.json()
-            status = data.get("status", "UNKNOWN")
-
-            if status == "SUCCESS":
-                video_url = ""
-                if data.get("results") and len(data["results"]) > 0:
-                    video_url = data["results"][0].get("url", "")
-
-                print(f"[RunningHub] Task completed in ~{elapsed}s. Video URL: {video_url}")
-
-                # ── 下载视频到本地 uploads 目录 ──
-                local_video_path = ""
-                if video_url:
-                    try:
-                        video_filename = f"video_{task_id}.mp4"
-                        video_filepath = UPLOAD_DIR / video_filename
-                        print(f"[RunningHub] Downloading video to {video_filename}...")
-                        video_resp = requests.get(video_url, timeout=120)
-                        if video_resp.status_code == 200:
-                            with open(video_filepath, "wb") as f:
-                                f.write(video_resp.content)
-                            local_video_path = f"/uploads/{video_filename}"
-                            print(f"[RunningHub] Video saved: {video_filename} ({len(video_resp.content)} bytes)")
-                        else:
-                            print(f"[RunningHub] Download failed: HTTP {video_resp.status_code}")
-                    except Exception as dl_err:
-                        print(f"[RunningHub] Warning: Failed to download video: {dl_err}")
-
-                return json.dumps({
-                    "status": "success",
-                    "task_id": task_id,
-                    "video_url": video_url,
-                    "local_video_path": local_video_path,
-                    "elapsed_seconds": elapsed,
-                    "message": f"视频生成完成! 耗时约 {elapsed} 秒。",
-                }, ensure_ascii=False)
-
-            elif status in ("RUNNING", "QUEUED"):
-                print(f"[RunningHub] Status: {status} (waited {elapsed}s / {max_wait}s)")
-                continue
-
-            else:
-                error_msg = data.get("errorMessage", "未知错误")
-                print(f"[RunningHub] Task failed: {error_msg}")
-                return json.dumps({
-                    "status": "error",
-                    "task_id": task_id,
-                    "message": f"视频生成失败: {error_msg}",
-                }, ensure_ascii=False)
-
-        except Exception as e:
-            print(f"[RunningHub] Query exception: {e}")
-            continue
-
-    # ── 超时 ──
+    print(f"[RunningHub] Background polling started for task {task_id}")
     return json.dumps({
-        "status": "timeout",
+        "status": "submitted",
         "task_id": task_id,
-        "message": f"视频生成超时 (等待超过 {max_wait} 秒)，任务 ID: {task_id}，可稍后手动查询。",
+        "message": "视频生成任务已提交，正在后台生成中。你可以继续聊天，视频完成后会自动通知。",
     }, ensure_ascii=False)
 
 
@@ -474,7 +447,7 @@ def submit_kling_video_task(
     sound: bool = True,
 ) -> str:
     """调用 RunningHub Kling V3.0 Pro 图生视频 API，根据首帧图片和 Prompt 生成视频。
-    工具会自动轮询任务状态，直到视频生成完成或超时。
+    任务提交后立即返回，视频在后台异步生成，完成后自动通知用户。
 
     Args:
         prompt: 视频生成的提示词，描述视频内容、场景、动作、对白等。
@@ -535,7 +508,6 @@ def submit_kling_video_task(
     print(f"[Kling V3.0 Pro] Image files: {len(image_files)} | First frame: {filename}")
 
     # ── 提交任务 ──
-    begin = time.time()
     try:
         response = requests.post(submit_url, headers=headers, json=payload, timeout=60)
         if response.status_code != 200:
@@ -559,84 +531,26 @@ def submit_kling_video_task(
             "message": f"提交请求异常: {e}",
         }, ensure_ascii=False)
 
-    # ── 轮询任务状态，直到完成或超时 ──
-    query_url = f"{RUNNINGHUB_API_BASE}/query"
-    max_wait = 600      # 最长等待 10 分钟
-    poll_interval = 5   # 每 5 秒查询一次
-    elapsed = 0
+    # ── 注册任务并启动后台轮询（异步，不阻塞对话） ──
+    with _video_task_lock:
+        _video_tasks[task_id] = {
+            "status": "running",
+            "task_id": task_id,
+            "message": "视频正在生成中...",
+            "elapsed_seconds": 0,
+        }
 
-    while elapsed < max_wait:
-        time.sleep(poll_interval)
-        elapsed = int(time.time() - begin)
+    threading.Thread(
+        target=_poll_video_task_bg,
+        args=(task_id, RUNNINGHUB_API_BASE, api_key, "kling"),
+        daemon=True,
+    ).start()
 
-        try:
-            resp = requests.post(
-                query_url, headers=headers,
-                json={"taskId": task_id}, timeout=15,
-            )
-            if resp.status_code != 200:
-                print(f"[Kling V3.0 Pro] Query error: HTTP {resp.status_code}")
-                continue
-
-            data = resp.json()
-            status = data.get("status", "UNKNOWN")
-
-            if status == "SUCCESS":
-                video_url = ""
-                if data.get("results") and len(data["results"]) > 0:
-                    video_url = data["results"][0].get("url", "")
-
-                print(f"[Kling V3.0 Pro] Task completed in ~{elapsed}s. Video URL: {video_url}")
-
-                # ── 下载视频到本地 uploads 目录 ──
-                local_video_path = ""
-                if video_url:
-                    try:
-                        video_filename = f"video_kling_{task_id}.mp4"
-                        video_filepath = UPLOAD_DIR / video_filename
-                        print(f"[Kling V3.0 Pro] Downloading video to {video_filename}...")
-                        video_resp = requests.get(video_url, timeout=120)
-                        if video_resp.status_code == 200:
-                            with open(video_filepath, "wb") as f:
-                                f.write(video_resp.content)
-                            local_video_path = f"/uploads/{video_filename}"
-                            print(f"[Kling V3.0 Pro] Video saved: {video_filename} ({len(video_resp.content)} bytes)")
-                        else:
-                            print(f"[Kling V3.0 Pro] Download failed: HTTP {video_resp.status_code}")
-                    except Exception as dl_err:
-                        print(f"[Kling V3.0 Pro] Warning: Failed to download video: {dl_err}")
-
-                return json.dumps({
-                    "status": "success",
-                    "task_id": task_id,
-                    "video_url": video_url,
-                    "local_video_path": local_video_path,
-                    "elapsed_seconds": elapsed,
-                    "message": f"视频生成完成! 耗时约 {elapsed} 秒。",
-                }, ensure_ascii=False)
-
-            elif status in ("RUNNING", "QUEUED"):
-                print(f"[Kling V3.0 Pro] Status: {status} (waited {elapsed}s / {max_wait}s)")
-                continue
-
-            else:
-                error_msg = data.get("errorMessage", "未知错误")
-                print(f"[Kling V3.0 Pro] Task failed: {error_msg}")
-                return json.dumps({
-                    "status": "error",
-                    "task_id": task_id,
-                    "message": f"视频生成失败: {error_msg}",
-                }, ensure_ascii=False)
-
-        except Exception as e:
-            print(f"[Kling V3.0 Pro] Query exception: {e}")
-            continue
-
-    # ── 超时 ──
+    print(f"[Kling V3.0 Pro] Background polling started for task {task_id}")
     return json.dumps({
-        "status": "timeout",
+        "status": "submitted",
         "task_id": task_id,
-        "message": f"视频生成超时 (等待超过 {max_wait} 秒)，任务 ID: {task_id}，可稍后手动查询。",
+        "message": "视频生成任务已提交，正在后台生成中。你可以继续聊天，视频完成后会自动通知。",
     }, ensure_ascii=False)
 
 
@@ -866,6 +780,111 @@ def _image_to_base64_uri(image_path: str) -> str:
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     return f"data:{mime_type};base64,{b64}"
+
+
+def _poll_video_task_bg(
+    task_id: str,
+    api_base: str,
+    api_key: str,
+    task_type: str = "seedance",
+    max_wait: int = 600,
+    poll_interval: int = 5,
+):
+    """后台线程：轮询视频生成任务状态直到完成 / 失败 / 超时，完成后触发回调。"""
+    query_url = f"{api_base}/query"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    label = "Kling V3.0 Pro" if task_type == "kling" else "RunningHub"
+    begin = time.time()
+
+    while True:
+        time.sleep(poll_interval)
+        elapsed = int(time.time() - begin)
+        if elapsed >= max_wait:
+            print(f"[{label}] Task {task_id} timed out after {max_wait}s")
+            with _video_task_lock:
+                _video_tasks[task_id] = {
+                    "status": "timeout",
+                    "task_id": task_id,
+                    "message": f"视频生成超时 (等待超过 {max_wait} 秒)，任务 ID: {task_id}，可稍后手动查询。",
+                }
+            _fire_video_callback(task_id)
+            return
+
+        try:
+            resp = requests.post(
+                query_url, headers=headers,
+                json={"taskId": task_id}, timeout=15,
+            )
+            if resp.status_code != 200:
+                print(f"[{label}] Query error: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            status = data.get("status", "UNKNOWN")
+
+            if status == "SUCCESS":
+                video_url = ""
+                if data.get("results") and len(data["results"]) > 0:
+                    video_url = data["results"][0].get("url", "")
+
+                print(f"[{label}] Task {task_id} completed in ~{elapsed}s. Video URL: {video_url}")
+
+                # ── 下载视频到本地 uploads 目录 ──
+                local_video_path = ""
+                if video_url:
+                    try:
+                        prefix = "video_kling_" if task_type == "kling" else "video_"
+                        video_filename = f"{prefix}{task_id}.mp4"
+                        video_filepath = UPLOAD_DIR / video_filename
+                        print(f"[{label}] Downloading video to {video_filename}...")
+                        video_resp = requests.get(video_url, timeout=120)
+                        if video_resp.status_code == 200:
+                            with open(video_filepath, "wb") as f:
+                                f.write(video_resp.content)
+                            local_video_path = f"/uploads/{video_filename}"
+                            print(f"[{label}] Video saved: {video_filename} ({len(video_resp.content)} bytes)")
+                        else:
+                            print(f"[{label}] Download failed: HTTP {video_resp.status_code}")
+                    except Exception as dl_err:
+                        print(f"[{label}] Warning: Failed to download video: {dl_err}")
+
+                with _video_task_lock:
+                    _video_tasks[task_id] = {
+                        "status": "success",
+                        "task_id": task_id,
+                        "video_url": video_url,
+                        "local_video_path": local_video_path,
+                        "elapsed_seconds": elapsed,
+                        "message": f"视频生成完成! 耗时约 {elapsed} 秒。",
+                    }
+                _fire_video_callback(task_id)
+                return
+
+            elif status in ("RUNNING", "QUEUED"):
+                print(f"[{label}] Task {task_id}: {status} (waited {elapsed}s / {max_wait}s)")
+                with _video_task_lock:
+                    if task_id in _video_tasks:
+                        _video_tasks[task_id]["elapsed_seconds"] = elapsed
+                continue
+
+            else:
+                error_msg = data.get("errorMessage", "未知错误")
+                print(f"[{label}] Task {task_id} failed: {error_msg}")
+                with _video_task_lock:
+                    _video_tasks[task_id] = {
+                        "status": "error",
+                        "task_id": task_id,
+                        "message": f"视频生成失败: {error_msg}",
+                    }
+                _fire_video_callback(task_id)
+                return
+
+        except Exception as e:
+            print(f"[{label}] Query exception: {e}")
+            continue
 
 
 def get_client() -> genai.Client:

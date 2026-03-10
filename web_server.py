@@ -29,6 +29,8 @@ from fenjing_agent import (
     ToolMessage,
     build_graph,
     clear_web_ask_callback,
+    get_video_task_status,
+    register_video_done_callback,
     set_web_ask_callback,
 )
 
@@ -69,6 +71,10 @@ class AgentSession:
         self.agent_thread: threading.Thread | None = None
         self.uploaded_files: list[dict] = []
         self.is_waiting_answer: bool = False
+        # ── 视频任务异步通知 ──
+        self.pending_video_tasks: list[str] = []
+        self.video_notifications: list[dict] = []
+        self._video_notify_lock = threading.Lock()
 
     # ── SSE 事件辅助 ──
     @staticmethod
@@ -88,6 +94,19 @@ class AgentSession:
         finally:
             self.is_waiting_answer = False
         return answer
+
+    # ── 视频任务异步回调 ──
+    def _on_video_done(self, task_id: str, result: dict):
+        """视频后台生成完成时的回调，将结果存入通知队列。"""
+        with self._video_notify_lock:
+            self.video_notifications.append(result)
+
+    def get_video_notifications(self) -> list[dict]:
+        """获取并清空已完成的视频通知列表（供前端轮询）。"""
+        with self._video_notify_lock:
+            notifs = list(self.video_notifications)
+            self.video_notifications.clear()
+            return notifs
 
     # ── 启动流式 Agent ──
     def start_streaming(self, text: str, file_urls: list[str] | None = None):
@@ -169,14 +188,16 @@ class AgentSession:
                                 except (json.JSONDecodeError, TypeError):
                                     pass
 
-                            # ── 视频生成结果：提取 video_url / local_video_path ──
-                            video_url = ""
-                            local_video_path = ""
-                            if msg.name == "submit_seedance_task":
+                            # ── 视频任务提交：提取 task_id 并注册完成回调 ──
+                            video_task_id = ""
+                            if msg.name in ("submit_seedance_task", "submit_kling_video_task"):
                                 try:
                                     data = json.loads(str(msg.content))
-                                    video_url = data.get("video_url", "")
-                                    local_video_path = data.get("local_video_path", "")
+                                    tid = data.get("task_id", "")
+                                    if tid and data.get("status") == "submitted":
+                                        video_task_id = tid
+                                        self.pending_video_tasks.append(tid)
+                                        register_video_done_callback(tid, self._on_video_done)
                                 except (json.JSONDecodeError, TypeError):
                                     pass
 
@@ -184,8 +205,7 @@ class AgentSession:
                                 "name": msg.name,
                                 "content": str(msg.content)[:800],
                                 "image_urls": image_urls,
-                                "video_url": video_url,
-                                "local_video_path": local_video_path,
+                                "video_task_id": video_task_id,
                             }))
 
             put(sse("done", {}))
@@ -308,6 +328,21 @@ async def upload_files(
 def get_state(session_id: str):
     """获取当前工作流状态。"""
     return _get_session(session_id).get_state()
+
+
+@app.get("/api/video-notifications/{session_id}")
+def video_notifications(session_id: str):
+    """获取已完成的视频生成通知（前端轮询用，取后即清）。"""
+    return {"notifications": _get_session(session_id).get_video_notifications()}
+
+
+@app.get("/api/video-status/{session_id}/{task_id}")
+def video_status(session_id: str, task_id: str):
+    """查询指定视频任务的当前状态。"""
+    status = get_video_task_status(task_id)
+    if status is None:
+        return {"status": "unknown", "message": "未找到该任务"}
+    return status
 
 
 @app.get("/")
