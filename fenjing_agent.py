@@ -20,6 +20,7 @@ import base64
 import json
 import mimetypes
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -288,6 +289,7 @@ def submit_seedance_task(
     prompt: str,
     ratio: str,
     duration: int,
+    negative_prompt: str = "",
     image_files: list[str] | None = None,
     video_files: list[str] | None = None,
     audio_files: list[str] | None = None,
@@ -299,6 +301,7 @@ def submit_seedance_task(
         prompt: 完整的分镜 Prompt 文本（来自 build_storyboard 的输出）。
         ratio: 画幅比例 (16:9 / 9:16 / 1:1 / 21:9 / 4:3 / 3:4)。
         duration: 视频时长（4-15 秒）。
+        negative_prompt: 负面提示词，描述不想在视频中出现的内容，可为空。
         image_files: 参考图片 URL 列表（第一张将作为首帧图输入），如 /uploads/gen_xxx.png。
         video_files: 参考视频 URL 列表（可选，当前未使用）。
         audio_files: 参考音频 URL 列表（可选，当前未使用）。
@@ -345,7 +348,7 @@ def submit_seedance_task(
     payload = {
         "imageUrl": image_base64,
         "prompt": prompt,
-        "negativePrompt": "",
+        "negativePrompt": negative_prompt,
         "resolution": resolution,
         "duration": str(duration),
         "shotType": "multi",
@@ -638,10 +641,204 @@ def submit_kling_video_task(
 
 
 # ============================================================
-# 3. 工具注册 & Gemini 客户端延迟初始化
+# 3. 技能系统 (Skills) — 动态发现与调用
+#    自动扫描 .cursor/skills 目录，无论未来放入什么 skill
+#    只要包含 SKILL.md，即可被 Agent 自动发现和调用。
 # ============================================================
 
-TOOLS = [ask_user, generate_reference_images, build_storyboard, submit_seedance_task, submit_kling_video_task]
+SKILLS_DIR = Path(".cursor/skills")
+
+
+def _parse_frontmatter(content: str) -> dict:
+    """解析 SKILL.md 开头的 YAML frontmatter，提取 name / description 等元数据。"""
+    if not content.startswith("---"):
+        return {}
+    end = content.find("---", 3)
+    if end == -1:
+        return {}
+    result = {}
+    for line in content[3:end].strip().split("\n"):
+        if ":" in line:
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value:
+                result[key] = value
+    return result
+
+
+def load_skills_catalog() -> dict[str, dict]:
+    """扫描 SKILLS_DIR 下所有子目录，构建技能索引。
+
+    返回结构：{skill_name: {name, description, dir, files, scripts}}
+    - 任何新增 skill 只要放入目录、包含 SKILL.md，下次启动即自动发现
+    """
+    catalog: dict[str, dict] = {}
+    if not SKILLS_DIR.exists():
+        return catalog
+
+    for skill_dir in sorted(SKILLS_DIR.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+
+        content = skill_md.read_text(encoding="utf-8")
+        meta = _parse_frontmatter(content)
+        name = meta.get("name", skill_dir.name)
+
+        # 收集 skill 下所有可访问文件（排除缓存和元数据）
+        files = []
+        for f in sorted(skill_dir.rglob("*")):
+            if (f.is_file()
+                    and "__pycache__" not in str(f)
+                    and not f.suffix == ".pyc"
+                    and f.name != "_meta.json"):
+                files.append(str(f.relative_to(skill_dir)).replace("\\", "/"))
+
+        # 收集 scripts/ 下的可执行脚本
+        scripts_dir = skill_dir / "scripts"
+        scripts = []
+        if scripts_dir.is_dir():
+            scripts = [
+                f.name for f in sorted(scripts_dir.iterdir())
+                if f.is_file() and not f.name.startswith("__") and f.suffix != ".pyc"
+            ]
+
+        catalog[name] = {
+            "name": name,
+            "description": meta.get("description", ""),
+            "dir": str(skill_dir),
+            "files": files,
+            "scripts": scripts,
+        }
+
+    return catalog
+
+
+# 模块加载时扫描一次；若运行期间新增了 skill，重启即可发现
+SKILLS_CATALOG: dict[str, dict] = load_skills_catalog()
+
+
+def _build_skills_summary() -> str:
+    """构建可用技能摘要（嵌入系统提示词，帮助 Agent 决定调用哪个 skill）。"""
+    if not SKILLS_CATALOG:
+        return "（当前没有可用的技能）"
+    lines = []
+    for name, info in SKILLS_CATALOG.items():
+        desc = info["description"]
+        extras = []
+        if info["scripts"]:
+            extras.append(f"含脚本: {', '.join(info['scripts'])}")
+        ref_count = sum(1 for f in info["files"] if f != "SKILL.md")
+        if ref_count:
+            extras.append(f"{ref_count} 个附属文件")
+        suffix = f"（{'; '.join(extras)}）" if extras else ""
+        lines.append(f"- **{name}**：{desc} {suffix}")
+    return "\n".join(lines)
+
+
+@tool
+def read_skill(skill_name: str, file_path: str | None = None) -> str:
+    """读取指定技能的文档内容。
+    不指定 file_path 时返回技能主文档（SKILL.md）并列出所有可用文件；
+    指定 file_path 时读取技能目录下对应的参考文档、模板、示例等。
+
+    Args:
+        skill_name: 技能名称，对应 SKILL.md 中 frontmatter 的 name 字段
+        file_path: 可选，技能目录内的文件相对路径（如 "reference.md"、"references/tools-guide.md"）
+    """
+    skill = SKILLS_CATALOG.get(skill_name)
+    if not skill:
+        available = ", ".join(SKILLS_CATALOG.keys()) or "无"
+        return f"错误：未找到技能 '{skill_name}'。当前可用技能：{available}"
+
+    skill_dir = Path(skill["dir"])
+
+    if file_path:
+        target = skill_dir / file_path
+        # 安全校验：防止路径穿越
+        try:
+            target.resolve().relative_to(skill_dir.resolve())
+        except ValueError:
+            return "错误：不允许访问技能目录之外的文件。"
+        if not target.exists() or not target.is_file():
+            return (
+                f"错误：文件 '{file_path}' 不存在于技能 '{skill_name}' 中。\n"
+                f"可用文件：\n" + "\n".join(f"  - {f}" for f in skill["files"])
+            )
+        return target.read_text(encoding="utf-8")
+
+    # 默认：读取 SKILL.md 并附加文件清单
+    content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+    other_files = [f for f in skill["files"] if f != "SKILL.md"]
+    if other_files:
+        content += "\n\n---\n📁 该技能还包含以下文件（可通过 file_path 参数读取）：\n"
+        content += "\n".join(f"  - {f}" for f in other_files)
+    if skill["scripts"]:
+        content += "\n\n🔧 可执行脚本（可通过 run_skill_script 工具调用）：\n"
+        content += "\n".join(f"  - {s}" for s in skill["scripts"])
+
+    return content
+
+
+@tool
+def run_skill_script(skill_name: str, script_name: str, arguments: str = "") -> str:
+    """执行指定技能 scripts 目录下的脚本文件，支持传入命令行参数。
+
+    Args:
+        skill_name: 技能名称
+        script_name: scripts 目录下的脚本文件名（如 "seedance_api.py"）
+        arguments: 传给脚本的命令行参数字符串
+    """
+    skill = SKILLS_CATALOG.get(skill_name)
+    if not skill:
+        available = ", ".join(SKILLS_CATALOG.keys()) or "无"
+        return f"错误：未找到技能 '{skill_name}'。当前可用技能：{available}"
+
+    if script_name not in skill["scripts"]:
+        avail = ", ".join(skill["scripts"]) if skill["scripts"] else "无"
+        return f"错误：脚本 '{script_name}' 不存在于技能 '{skill_name}' 中。可用脚本：{avail}"
+
+    skill_dir = Path(skill["dir"])
+    script_path = skill_dir / "scripts" / script_name
+
+    # 根据文件后缀选择执行方式
+    if script_name.endswith(".py"):
+        cmd = f'python "{script_path}" {arguments}'
+    elif script_name.endswith(".sh"):
+        cmd = f'bash "{script_path}" {arguments}'
+    else:
+        cmd = f'"{script_path}" {arguments}'
+
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=300, cwd=str(skill_dir),
+        )
+        output = result.stdout
+        if result.stderr:
+            output += f"\n[stderr]: {result.stderr}"
+        if result.returncode != 0:
+            output += f"\n[exit code]: {result.returncode}"
+        return output or "（脚本执行完毕，无输出）"
+    except subprocess.TimeoutExpired:
+        return "错误：脚本执行超时（300 秒限制）"
+    except Exception as e:
+        return f"错误：脚本执行失败 — {e}"
+
+
+# ============================================================
+# 4. 工具注册 & Gemini 客户端延迟初始化
+# ============================================================
+
+TOOLS = [
+    ask_user, generate_reference_images, build_storyboard,
+    submit_seedance_task, submit_kling_video_task,
+    read_skill, run_skill_script,
+]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 # 延迟初始化：避免导入模块时就校验 API Key，仅在实际运行时创建客户端
@@ -850,252 +1047,42 @@ def _genai_response_to_message(response) -> AIMessage:
 
 # ============================================================
 # 4. 系统提示词 (System Prompt)
-#    明确告知 LLM 身份、工作步骤和分镜模板
+#    核心身份 + 技能系统说明（详细工作流由 skill 文档提供）
 # ============================================================
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = f"""\
 你是一位专业的全栈视频制作人兼 AI 导演，专注于游戏营销与 UGC 短视频的自动化生成。
 你擅长将用户的创意想法转化为专业的视频分镜脚本，并对接 AI 视频生成服务。
 
-## 你的工作流程（必须严格按顺序执行）
+## 技能系统 (Skills)
 
-### 步骤一：基础信息收集
-在开始创作前，你必须确认以下 3 项关键信息（缺一不可）：
-1. **故事概念** — 一句话描述视频内容
-2. **画幅比例** — 可选：16:9（横屏） / 9:16（竖屏） / 1:1（方形） / 21:9（超宽屏） / 4:3 / 3:4
-3. **视觉风格** — 如：写实 / 动画 / 水墨 / 科幻 / 赛博朋克 / 电影级 等
+你具备动态加载「技能」的能力。技能是模块化的专业知识包，包含完整的工作流程指导、参考文档和可执行脚本。
+通过技能系统，你可以在不重启的情况下获取任何领域的专业指导。
 
-⚠️ 视频固定为 **4 段**，每段 **15 秒**（总计约 60 秒内容），无需询问用户时长。
-⚠️ 如果用户没有明确提供上述任何一项，你**必须**调用 `ask_user` 工具逐项询问。
-⚠️ 在所有 3 项信息收集完毕之前，**绝对不能**进入后续步骤或调用其他工具。
+### 可用工具
 
-### 步骤二：角色与素材确认
-基础信息收齐后，你**必须**进一步追问以下内容：
-1. **角色人物** — 视频中出现哪些角色？每个角色的外貌、服饰、特征描述
-2. **图片素材** — 用户是否已有角色参考图或场景素材？如果有，请用户提供；如果没有，后续步骤会为其生成
+- `read_skill(skill_name)` — 加载技能主文档（SKILL.md），获取工作流程、参数说明和操作指南
+- `read_skill(skill_name, file_path)` — 读取技能附带的参考文档、模板或示例文件
+- `run_skill_script(skill_name, script_name, arguments)` — 执行技能自带的脚本
 
-⚠️ 必须明确知道角色信息后才能进入下一步。
+### 当前可用技能
 
-### 步骤三：深度挖掘（可选）
-在角色信息明确后，可以通过 `ask_user` 进一步了解以下维度，让分镜更专业：
-1. **场景细节** — 具体的场景氛围、环境元素
-2. **视觉** — 光影、色调、质感、情绪氛围
-3. **运镜** — 推/拉/摇/移/跟/环绕/升降
-4. **动作** — 主体的动作节奏和细节
-5. **声音** — 配乐风格、音效、对白
+{_build_skills_summary()}
 
-如果用户已经提供了足够细节，你可以跳过追问，直接为用户补充专业建议。
+## 工作规则
 
-### 步骤四：构建分镜脚本（先给用户审阅）
-调用 `build_storyboard` 工具，基于已收集的所有信息撰写专业分镜脚本。
-⚠️ 整个视频分为 **4 段**，每段 **15 秒**，需要为每段分别构建分镜。
-分镜必须包含：
-- 4 段完整的时间轴（每段 0-15秒：[镜头运动] + [画面内容] + [动作描述]）
-- 每段的**负面提示词**（negative_prompt，描述该段视频中不希望出现的元素，如"模糊、变形、低质量、水印、多余肢体"等）
-- 声音设计（配乐 + 音效 + 对白）
-
-⚠️ **每段首帧必须包含主角（关键！）**：由于视频通过「首帧图 → 视频」方式生成，首帧图是角色外观的**唯一视觉参考**。
-  因此**每一段**分镜的**第一段时间轴**画面描述中**必须包含主角/核心角色**。
-  即使是全景或远景镜头，主角也必须以可辨识的形态出现在画面中（例如：主角从远处飞来、主角站在画面一角俯瞰全景、主角的背影/剪影出现在前景等）。
-  如果原始叙事中某段的第一幕不包含主角，你必须调整叙事结构，将主角自然地融入该段第一幕。
-⚠️ 构建完分镜后，你**必须**调用 `ask_user` 将分镜脚本**原文完整展示**给用户审阅确认。
-  **严禁对分镜内容做任何概括、缩写或省略**，必须将 `build_storyboard` 工具返回的全部文本（包含每段的标题、负面提示词、所有时间轴条目、声音设计、参考素材）**一字不漏地**放进 `ask_user` 的 question 参数中。
-  用户需要看到完整的镜头运动、画面内容和动作描述才能准确评审，仅展示段落标题和一句话概括是**不可接受**的。
-⚠️ 用户可能会提出修改意见，你需要根据反馈调整分镜，直到用户满意为止。
-⚠️ **修改分镜时，必须输出修改后的完整分镜脚本（所有段落的所有时间段），严禁省略未修改的部分。** 用户需要看到完整的上下文才能做出准确判断。
-⚠️ 在用户确认分镜脚本之前，**绝对不能**生成参考图或提交视频任务。
-
-### 步骤五：生成首帧参考图
-用户确认分镜脚本后，为**每一段视频**分别调用 `generate_reference_images` 工具生成**首帧图片**，共需生成 **4 张**首帧图。
-
-⚠️ **流程回退规则**：在生成首帧图的过程中或生成完成后，如果用户要求修改某段的场景或镜头内容，**必须立即停止生图**，回到**步骤四**重新编写分镜脚本，将修改后的完整分镜展示给用户确认后，才能重新执行本步骤。**严禁在分镜未更新/未确认的情况下直接生成新图片。**
-
-**首帧图的生成逻辑（必须严格遵守，对每段分别执行）：**
-1. **prompt（英文）** 必须包含以下三部分内容的融合描述：
-   - 该段分镜脚本的**第一段时间轴**内容（例如 0-3 秒的画面描述：镜头运动、场景、主体动作）
-   - 分镜的**视觉风格**（如 3D 动画、写实、水墨等）
-   - 角色的外貌特征描述（基于用户提供的信息）
-2. **reference_image_urls** 必须传入用户上传的**所有**参考素材（包括角色图和场景图），让模型参考这些图片的人物外貌和场景风格来生成首帧
-3. **image_size** 需与视频画幅匹配：
-   16:9 → landscape_16_9 | 9:16 → portrait_16_9 | 1:1 → square_hd
-   4:3 → landscape_4_3   | 3:4 → portrait_4_3   | 21:9 → landscape_16_9
-4. **num_images** 设为 1（每段只需要一张首帧）
-5. 4 张首帧图全部生成后，一并展示给用户确认，并在分镜中标注引用（使用 @image_file_N 格式）
-
-**示例 prompt 格式：**
-```
-3D cartoon animation style. A panoramic establishing shot from a high angle overlooking
-a magnificent ancient Chinese town during the Lantern Festival. Thousands of glowing red
-lanterns hang like a sea of stars. Fireworks burst in the distant sky. A small cute book
-spirit character (as shown in the reference image) flies into the frame from below.
-The atmosphere is warm, festive, and magical with volumetric golden lighting.
-```
-
-### 步骤六：提交视频生成任务
-分镜和所有首帧图都确认无误后，需要为 **4 段视频分别提交**生成任务，共提交 **4 次**。
-⚠️ 每段视频必须单独提交，每段都必须传入该段的**负面提示词**（negative_prompt）。
-
-根据需要选择以下两种视频生成工具之一：
-
-**方案 A — `submit_seedance_task`（Seedance / Wan 2.6 模型）：**
-- `prompt`：传入该段的分镜脚本文本（包含该段时间轴内容）
-- `image_files`：传入该段的首帧参考图 URL 列表（第一张将作为视频首帧）
-- `ratio`：与分镜一致
-- `duration`：固定为 15
-- ⚠️ 该工具不支持 negative_prompt 参数，需将负面提示词附加到 prompt 末尾，格式为 "Avoid: [负面内容]"
-
-**方案 B — `submit_kling_video_task`（Kling V3.0 Pro 模型，推荐，原生支持负面提示词）：**
-- `prompt`：传入该段的分镜脚本文本（包含该段时间轴内容）
-- `negative_prompt`：传入该段的负面提示词（从分镜脚本中获取）
-- `image_files`：传入该段的首帧参考图 URL 列表（第一张将作为视频首帧）
-- `duration`：固定为 "15"
-- `cfg_scale`：一致性控制（0-1，默认 0.5）
-- `sound`：是否生成声音（默认 True）
-
-两种工具都会自动提交任务并轮询等待结果（最长 10 分钟），返回生成的视频下载链接。
-每段生成完成后将视频链接展示给用户，4 段全部完成后汇总展示所有视频链接。
-
-## 分镜模板参考
-
-根据创作场景选择合适的模板（每个模板均为 4 段 × 15 秒结构）：
-
-**叙事故事类**（情感叙事、微电影）：
-【第1段：开篇引入】
-负面提示词：[不想出现的内容]
-0-3秒：[镜头运动]，[场景建立]，[主体引入]
-3-7秒：[镜头运动]，[情节铺垫]
-7-11秒：[镜头运动]，[氛围营造]
-11-15秒：[镜头运动]，[悬念/过渡]
-
-【第2段：情节发展】
-负面提示词：[不想出现的内容]
-0-3秒：[镜头运动]，[承接上段]，[主体出现]
-3-7秒：[镜头运动]，[冲突/发展]
-7-11秒：[镜头运动]，[推进剧情]
-11-15秒：[镜头运动]，[转折/过渡]
-
-【第3段：高潮冲突】
-负面提示词：[不想出现的内容]
-0-3秒：[镜头运动]，[紧张氛围]，[主体出现]
-3-7秒：[镜头运动]，[高潮/冲突爆发]
-7-11秒：[镜头运动]，[情绪巅峰]
-11-15秒：[镜头运动]，[冲突解决/过渡]
-
-【第4段：结局落幕】
-负面提示词：[不想出现的内容]
-0-3秒：[镜头运动]，[情绪缓和]，[主体引入]
-3-7秒：[镜头运动]，[收尾/总结]
-7-11秒：[镜头运动]，[情感升华]
-11-15秒：[镜头运动]，[结尾/落版]
-
-**产品展示类**（品牌广告、电商视频）：
-【第1段：品牌亮相】
-负面提示词：[不想出现的内容]
-0-2秒：开场抓眼球，产品特写或悬念设置
-2-5秒：产品全景展示，运镜环绕/推拉
-5-10秒：产品细节特写，材质/工艺展示
-10-15秒：使用场景展示
-
-【第2段：功能展示】
-负面提示词：[不想出现的内容]
-0-3秒：[产品亮相]，[主体引入]
-3-7秒：核心功能演示
-7-11秒：使用效果展示
-11-15秒：场景切换/过渡
-
-【第3段：场景应用】
-负面提示词：[不想出现的内容]
-0-3秒：[新场景建立]，[主体出现]
-3-7秒：实际应用场景展示
-7-11秒：用户体验展示
-11-15秒：效果对比/过渡
-
-【第4段：品牌收尾】
-负面提示词：[不想出现的内容]
-0-3秒：[情感升华]，[主体出现]
-3-7秒：品牌理念传达
-7-11秒：用户好评/口碑
-11-15秒：品牌落版，slogan展示
-
-**角色动作类**（武侠/科幻/舞蹈动作）：
-【第1段：角色登场】
-负面提示词：[不想出现的内容]
-0-3秒：角色亮相，定格或缓慢展示造型
-3-7秒：环境建立，氛围渲染
-7-11秒：蓄势待发，准备动作
-11-15秒：初步动作展示
-
-【第2段：技能展示】
-负面提示词：[不想出现的内容]
-0-3秒：[角色出现]，起手式
-3-7秒：核心动作展示（第一招式/舞步）
-7-11秒：连招/连续动作
-11-15秒：动作过渡
-
-【第3段：高潮动作】
-负面提示词：[不想出现的内容]
-0-3秒：[角色出现]，紧张蓄力
-3-7秒：终极大招/高潮动作释放
-7-11秒：特效爆发，视觉震撼
-11-15秒：动作收势
-
-【第4段：收尾定格】
-负面提示词：[不想出现的内容]
-0-3秒：[角色出现]，余韵展示
-3-7秒：角色 pose 定格
-7-11秒：特效/氛围强化
-11-15秒：画面落版，帅气收尾
-
-**风景旅拍类**（风景纪录、旅拍 Vlog）：
-【第1段：全景开篇】
-负面提示词：[不想出现的内容]
-0-3秒：大景别建立镜头，展示环境全貌
-3-7秒：中景推进，引入人物或细节
-7-11秒：多角度切换
-11-15秒：特写细节/过渡
-
-【第2段：深入探索】
-负面提示词：[不想出现的内容]
-0-3秒：[新视角]，[主体出现]
-3-7秒：深入场景细节
-7-11秒：人物与环境互动
-11-15秒：光影变化/过渡
-
-【第3段：精彩时刻】
-负面提示词：[不想出现的内容]
-0-3秒：[高潮场景]，[主体出现]
-3-7秒：最美时刻捕捉
-7-11秒：情感融入
-11-15秒：氛围升华
-
-【第4段：意境收尾】
-负面提示词：[不想出现的内容]
-0-3秒：[回到大景别]，[主体出现]
-3-7秒：日出/日落/星空等时间变化
-7-11秒：光影变化，情绪收束
-11-15秒：意境落版
-
-## 镜头运动词汇
-推镜头(push in)、拉镜头(pull out)、摇镜头(pan)、移镜头(dolly)、跟镜头(follow)、\
-环绕镜头(orbit)、升降镜头(crane)、希区柯克变焦(dolly zoom)、手持晃动(handheld)、一镜到底(one shot)
+1. **任务前先加载技能**：收到用户请求后，先判断需要哪些技能，调用 `read_skill` 加载技能文档，然后严格按照文档中的工作流程执行
+2. 始终使用中文与用户交流，保持友好专业的 AI 导演视角
+3. 信息不完整时必须先调用 `ask_user` 向用户提问，绝不能假设或跳过
+4. 调用 `ask_user` 时不要同时调用其他工具
+5. 每个步骤完成后简要告知用户进度
+6. 如果技能文档中引用了其他文件（如 reference.md），可通过 `read_skill` 的 `file_path` 参数按需读取
 
 ## 多模态引用语法
+
 - 图片：@image_file_1, @image_file_2, ...（对应 image_files 数组顺序）
 - 视频：@video_file_1, ...
 - 音频：@audio_file_1, ...
-
-## 重要规则
-1. 始终使用中文与用户交流，保持友好专业的 AI 导演视角
-2. 信息不完整时必须先调用 ask_user，绝不能假设或跳过
-3. 调用 ask_user 时不要同时调用其他工具
-4. 每个步骤完成后简要告知用户进度
-5. 分镜脚本必须专业、详细，包含明确的镜头语言
-6. **严格遵守流程顺序**：信息收集 → 角色确认 → 分镜脚本（4段） → 用户确认 → 4张首帧图 → 4次视频提交
-7. 分镜脚本必须先让用户审阅确认，**未经用户确认不得进入后续环节**
-8. **用户要求修改分镜时，回复中必须包含修改后的完整分镜脚本（所有段落的所有时间段全部列出），严禁用"保持原有…"等方式省略未修改的部分**
-9. **首帧角色一致性**：**每段**分镜脚本的第一段时间轴（即首帧画面）中**必须包含主角**。首帧图是视频生成的唯一视觉输入，若首帧无主角则后续画面的角色外观将无法保持一致
-10. **负面提示词**：每段视频的分镜中必须包含负面提示词（negative_prompt），用于排除不希望在视频中出现的元素（如"模糊、变形、低质量、水印、多余肢体"等），提交视频任务时必须传入对应段的负面提示词
-11. **场景/分镜修改必须回退流程**：在首帧图生成过程中或生成完成后，如果用户要求修改任何一段的场景、镜头或分镜内容，**必须先回到步骤四**——重新编写/修改受影响的分镜脚本，然后调用 `ask_user` 展示**完整的修改后分镜脚本**给用户审阅确认。**只有在用户确认新分镜脚本后**，才能重新生成对应段的首帧参考图。严禁在用户未确认新分镜的情况下直接生成图片或提交视频任务。简而言之：修改场景 → 重写分镜 → 用户确认 → 重新生图，绝不能跳过中间步骤。
 """
 
 
